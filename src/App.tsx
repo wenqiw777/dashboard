@@ -8,7 +8,8 @@ import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch'
 import {
   BookOpen, ChevronRight, FileText, FolderOpen,
   Search, Save, Plus, FolderPlus, Eye, Code2,
-  Columns2, Layers, Minus, ZoomIn, ZoomOut, Maximize2
+  Columns2, Layers, Minus, ZoomIn, ZoomOut, Maximize2,
+  Moon, Sun
 } from 'lucide-react'
 import './index.css'
 
@@ -243,6 +244,12 @@ function App() {
     const saved = localStorage.getItem('learn-font-size')
     return saved ? Number(saved) : 16
   })
+  const [darkMode, setDarkMode] = useState(() => localStorage.getItem('learn-theme') === 'dark')
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', darkMode ? 'dark' : 'light')
+    localStorage.setItem('learn-theme', darkMode ? 'dark' : 'light')
+  }, [darkMode])
 
   const isDirty = content !== savedContent
 
@@ -409,6 +416,13 @@ function App() {
                 <Columns2 size={14} /> Split
               </button>
               <div className="tab-spacer" />
+              <button
+                className="theme-toggle"
+                onClick={() => setDarkMode(d => !d)}
+                title={darkMode ? 'Switch to light mode' : 'Switch to night mode'}
+              >
+                {darkMode ? <Sun size={14} /> : <Moon size={14} />}
+              </button>
               <div className="font-size-controls">
                 <button onClick={() => adjustFontSize(-1)} title="Decrease font size">
                   <Minus size={12} />
@@ -431,7 +445,7 @@ function App() {
                   value={content}
                   onChange={setContent}
                   extensions={[markdown()]}
-                  theme="light"
+                  theme={darkMode ? 'dark' : 'light'}
                   basicSetup={{
                     lineNumbers: true,
                     highlightActiveLine: true,

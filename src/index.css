@@ -39,6 +39,51 @@
   --font-mono: 'JetBrains Mono', monospace;
 
   --font-size-base: 16px;
+
+  /* Chart data series — muted, eye-friendly */
+  --chart-1: #5B8A72;  /* sage green */
+  --chart-2: #7BA7C9;  /* soft blue */
+  --chart-3: #C4A46D;  /* warm gold */
+  --chart-4: #C9827A;  /* muted coral */
+  --chart-5: #9B8EC4;  /* lavender */
+  --chart-6: #8E9E8A;  /* olive grey */
+}
+
+/* ─── Night Mode (warm, eye-friendly) ─── */
+[data-theme="dark"] {
+  --bg-primary: #1C1B19;
+  --bg-secondary: #242320;
+  --bg-tertiary: #2C2B27;
+  --bg-card: #22211E;
+  --bg-hover: #2A2924;
+  --bg-active: #33322C;
+
+  --text-primary: #D5D0C8;
+  --text-secondary: #ADA89E;
+  --text-tertiary: #7A766C;
+  --text-muted: #5C5850;
+
+  --accent: #7AB06E;
+  --accent-light: #2A3328;
+  --accent-hover: #8FC283;
+
+  --border: #35342F;
+  --border-light: #2E2D28;
+
+  --code-bg: #18170F;
+  --code-text: #C8C3B8;
+
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.15);
+  --shadow-md: 0 4px 12px rgba(0,0,0,0.25);
+  --shadow-lg: 0 8px 30px rgba(0,0,0,0.35);
+
+  /* Chart data series — lighter for dark backgrounds */
+  --chart-1: #7AB89A;
+  --chart-2: #94BDD8;
+  --chart-3: #D4BA85;
+  --chart-4: #D89B94;
+  --chart-5: #B3A8D6;
+  --chart-6: #A8B5A3;
 }
 
 html, body, #root {
@@ -911,4 +956,54 @@ pre:has(.widget-skeleton) {
   margin: 0;
   border: none;
   box-shadow: none;
+}
+
+/* ─── Night mode overrides ─── */
+
+[data-theme="dark"] ::-webkit-scrollbar-thumb { background: var(--border); }
+[data-theme="dark"] ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+[data-theme="dark"] .cm-editor .cm-gutters {
+  background: var(--bg-card) !important;
+  border-right-color: var(--border) !important;
+  color: var(--text-muted) !important;
+}
+
+[data-theme="dark"] .cm-editor .cm-activeLineGutter {
+  background: var(--bg-hover) !important;
+}
+
+[data-theme="dark"] .cm-editor .cm-activeLine {
+  background: rgba(122, 176, 110, 0.06) !important;
+}
+
+[data-theme="dark"] .cm-editor .cm-content {
+  color: var(--text-primary);
+  caret-color: var(--accent);
+}
+
+[data-theme="dark"] .cm-editor {
+  background: var(--bg-card);
+}
+
+/* Theme toggle button */
+.theme-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition: all var(--transition);
+  margin-right: 8px;
+}
+
+.theme-toggle:hover {
+  background: var(--bg-hover);
+  color: var(--accent);
+  border-color: var(--accent);
 }
