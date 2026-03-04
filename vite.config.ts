@@ -22,14 +22,8 @@ export default defineConfig({
       'react': path.resolve(__dirname, 'node_modules/react'),
       'react-dom': path.resolve(__dirname, 'node_modules/react-dom'),
       'recharts': path.resolve(__dirname, 'node_modules/recharts'),
-      '@nivo/core': path.resolve(__dirname, 'node_modules/@nivo/core'),
-      '@nivo/bar': path.resolve(__dirname, 'node_modules/@nivo/bar'),
-      '@nivo/radar': path.resolve(__dirname, 'node_modules/@nivo/radar'),
-      '@nivo/line': path.resolve(__dirname, 'node_modules/@nivo/line'),
-      '@nivo/pie': path.resolve(__dirname, 'node_modules/@nivo/pie'),
-      '@nivo/heatmap': path.resolve(__dirname, 'node_modules/@nivo/heatmap'),
-      '@nivo/network': path.resolve(__dirname, 'node_modules/@nivo/network'),
-      '@nivo/tooltip': path.resolve(__dirname, 'node_modules/@nivo/tooltip'),
+      'echarts': path.resolve(__dirname, 'node_modules/echarts'),
+      'echarts-for-react': path.resolve(__dirname, 'node_modules/echarts-for-react'),
     }
   }
 })
