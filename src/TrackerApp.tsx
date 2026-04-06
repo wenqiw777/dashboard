@@ -280,6 +280,9 @@ export default function TrackerApp() {
   const [showActivityCal, setShowActivityCal] = useState(false)
   const [blockTooltip, setBlockTooltip] = useState<{ text: string; x: number; y: number; trackId: string } | null>(null)
   const [dayRange, setDayRange] = useState<[number, number]>([0, 24]) // hours
+  const [isDraggingTimeline, setIsDraggingTimeline] = useState(false)
+  const [dragStartX, setDragStartX] = useState(0)
+  const [dragStartRange, setDragStartRange] = useState<[number, number]>([0, 24])
   const [heatmapTooltip, setHeatmapTooltip] = useState<{ text: string; x: number; y: number } | null>(null)
   const heatmapRef = useRef<HTMLDivElement>(null)
   const calendarRef = useRef<HTMLDivElement>(null)
@@ -1502,10 +1505,54 @@ export default function TrackerApp() {
                     const rangeStartMin = dayRange[0] * 60
                     const rangeEndMin = dayRange[1] * 60
                     const rangeDuration = rangeEndMin - rangeStartMin
-                    const hourLabels: number[] = []
-                    for (let h = Math.ceil(dayRange[0]); h <= Math.floor(dayRange[1]); h++) hourLabels.push(h)
-                    // Decide label interval based on range
-                    const labelInterval = rangeDuration <= 180 ? 1 : rangeDuration <= 480 ? 2 : rangeDuration <= 720 ? 3 : 1
+
+                    // Ruler tick generation
+                    const rulerTicks: { h: number; major: boolean }[] = []
+                    const step = rangeDuration <= 120 ? 0.5 : rangeDuration <= 360 ? 1 : rangeDuration <= 720 ? 2 : 3
+                    const labelStep = rangeDuration <= 120 ? 1 : rangeDuration <= 360 ? 2 : rangeDuration <= 720 ? 3 : 6
+                    for (let h = Math.ceil(dayRange[0] / step) * step; h <= dayRange[1]; h += step) {
+                      rulerTicks.push({ h, major: h % labelStep === 0 && h === Math.floor(h) })
+                    }
+
+                    const handleWheel = (e: React.WheelEvent) => {
+                      e.preventDefault()
+                      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+                      const mouseRatio = (e.clientX - rect.left) / rect.width
+                      const mouseHour = dayRange[0] + mouseRatio * (dayRange[1] - dayRange[0])
+                      const zoomFactor = e.deltaY > 0 ? 1.15 : 0.85
+                      const newSpan = Math.max(1, Math.min(24, (dayRange[1] - dayRange[0]) * zoomFactor))
+                      let newStart = mouseHour - mouseRatio * newSpan
+                      let newEnd = mouseHour + (1 - mouseRatio) * newSpan
+                      if (newStart < 0) { newEnd -= newStart; newStart = 0 }
+                      if (newEnd > 24) { newStart -= (newEnd - 24); newEnd = 24 }
+                      setDayRange([Math.max(0, newStart), Math.min(24, newEnd)])
+                    }
+
+                    const handleMouseDown = (e: React.MouseEvent) => {
+                      if (dayRange[0] === 0 && dayRange[1] === 24) return
+                      setIsDraggingTimeline(true)
+                      setDragStartX(e.clientX)
+                      setDragStartRange([...dayRange] as [number, number])
+                      const handleMouseMove = (ev: MouseEvent) => {
+                        const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+                        const dx = ev.clientX - e.clientX
+                        const hoursPerPx = (dayRange[1] - dayRange[0]) / rect.width
+                        const shift = -dx * hoursPerPx
+                        let s = dragStartRange[0] + shift
+                        let en = dragStartRange[1] + shift
+                        if (s < 0) { en -= s; s = 0 }
+                        if (en > 24) { s -= (en - 24); en = 24 }
+                        setDayRange([Math.max(0, s), Math.min(24, en)])
+                      }
+                      const handleMouseUp = () => {
+                        setIsDraggingTimeline(false)
+                        document.removeEventListener('mousemove', handleMouseMove)
+                        document.removeEventListener('mouseup', handleMouseUp)
+                      }
+                      document.addEventListener('mousemove', handleMouseMove)
+                      document.addEventListener('mouseup', handleMouseUp)
+                    }
+
                     return (
                       <>
                         <div className="t-activity-summary">
@@ -1515,15 +1562,24 @@ export default function TrackerApp() {
                             <button className="t-range-reset" onClick={() => setDayRange([0, 24])}>Reset</button>
                           )}
                         </div>
-                        <div className="t-timeline">
-                          <div className="t-timeline-hours">
-                            {hourLabels.map((h, i) => (
-                              <span key={h} className="t-timeline-hour-label"
-                                style={{ position: 'absolute', left: `${((h * 60 - rangeStartMin) / rangeDuration) * 100}%`, transform: 'translateX(-50%)' }}>
-                                {i % labelInterval === 0 ? h : ''}
-                              </span>
+                        <div
+                          className={`t-timeline t-timeline-zoomable${isDraggingTimeline ? ' dragging' : ''}`}
+                          onWheel={handleWheel}
+                          onMouseDown={handleMouseDown}
+                        >
+                          {/* Ruler */}
+                          <div className="t-ruler">
+                            {rulerTicks.map(({ h, major }) => (
+                              <div
+                                key={h}
+                                className={`t-ruler-tick${major ? ' major' : ''}`}
+                                style={{ left: `${((h * 60 - rangeStartMin) / rangeDuration) * 100}%` }}
+                              >
+                                {major && <span className="t-ruler-label">{h}</span>}
+                              </div>
                             ))}
                           </div>
+                          {/* Track */}
                           <div className="t-timeline-track">
                             {activityTimeline.blocks.map((block, i) => {
                               const startMin = block.start.getHours() * 60 + block.start.getMinutes()
@@ -1548,29 +1604,6 @@ export default function TrackerApp() {
                               )
                             })}
                             {blockTooltip?.trackId === 'day' && <div className="t-block-tooltip" style={{ left: blockTooltip.x, top: blockTooltip.y }}>{blockTooltip.text}</div>}
-                          </div>
-                          {/* Range slider */}
-                          <div className="t-range-slider">
-                            <input type="range" min={0} max={24} step={0.5} value={dayRange[0]}
-                              onChange={e => { const v = +e.target.value; if (v < dayRange[1] - 1) setDayRange([v, dayRange[1]]) }}
-                              className="t-range-input t-range-left" />
-                            <input type="range" min={0} max={24} step={0.5} value={dayRange[1]}
-                              onChange={e => { const v = +e.target.value; if (v > dayRange[0] + 1) setDayRange([dayRange[0], v]) }}
-                              className="t-range-input t-range-right" />
-                            <div className="t-range-fill" style={{
-                              left: `${(dayRange[0] / 24) * 100}%`,
-                              width: `${((dayRange[1] - dayRange[0]) / 24) * 100}%`,
-                            }} />
-                            {(dayRange[0] !== 0 || dayRange[1] !== 24) && (
-                              <>
-                                <span className="t-range-label" style={{ left: `${(dayRange[0] / 24) * 100}%` }}>
-                                  {`${Math.floor(dayRange[0])}:${dayRange[0] % 1 ? '30' : '00'}`}
-                                </span>
-                                <span className="t-range-label" style={{ left: `${(dayRange[1] / 24) * 100}%` }}>
-                                  {`${Math.floor(dayRange[1])}:${dayRange[1] % 1 ? '30' : '00'}`}
-                                </span>
-                              </>
-                            )}
                           </div>
                         </div>
                       </>

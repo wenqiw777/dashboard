@@ -1151,82 +1151,46 @@
   padding: 0;
 }
 
-/* Range slider for day view zoom */
-.t-range-slider {
-  position: relative;
-  height: 28px;
-  margin-top: 8px;
-}
-
-/* Base track line */
-.t-range-slider::before {
-  content: '';
-  position: absolute;
-  top: 9px;
-  left: 0;
-  right: 0;
-  height: 3px;
-  background: var(--border-light);
-  border-radius: 2px;
-}
-
-/* Active fill between thumbs */
-.t-range-fill {
-  position: absolute;
-  top: 9px;
-  height: 3px;
-  background: #D97757;
-  border-radius: 2px;
-  pointer-events: none;
-}
-
-.t-range-input {
-  position: absolute;
-  width: 100%;
-  top: 0;
-  height: 20px;
-  -webkit-appearance: none;
-  appearance: none;
-  background: transparent;
-  pointer-events: none;
-  margin: 0;
-}
-
-.t-range-input::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  background: #D97757;
-  border: 2px solid var(--bg-card);
-  box-shadow: 0 0 0 1px rgba(217, 119, 87, 0.3);
+/* Zoomable timeline — scroll to zoom, drag to pan */
+.t-timeline-zoomable {
   cursor: grab;
-  pointer-events: auto;
-  position: relative;
-  z-index: 2;
+  user-select: none;
 }
 
-.t-range-input::-webkit-slider-thumb:active {
+.t-timeline-zoomable.dragging {
   cursor: grabbing;
-  transform: scale(1.2);
-  box-shadow: 0 0 0 3px rgba(217, 119, 87, 0.2);
 }
 
-.t-range-input::-webkit-slider-runnable-track {
-  height: 3px;
-  background: transparent;
+/* Ruler */
+.t-ruler {
+  position: relative;
+  height: 24px;
+  border-bottom: 1px solid var(--border-light);
 }
 
-.t-range-label {
+.t-ruler-tick {
   position: absolute;
-  top: 20px;
+  bottom: 0;
+  width: 1px;
+  height: 6px;
+  background: var(--border);
+  opacity: 0.4;
+}
+
+.t-ruler-tick.major {
+  height: 12px;
+  opacity: 0.7;
+}
+
+.t-ruler-label {
+  position: absolute;
+  bottom: 13px;
+  left: 50%;
   transform: translateX(-50%);
-  font-size: 0.6rem;
-  color: #D97757;
-  font-weight: 600;
+  font-size: 0.62rem;
+  color: var(--text-muted);
   font-variant-numeric: tabular-nums;
-  pointer-events: none;
+  white-space: nowrap;
 }
 
 .t-range-reset {
@@ -1244,12 +1208,6 @@
 .t-range-reset:hover {
   color: var(--text-primary);
   border-color: var(--border);
-}
-
-/* Make hour labels container relative for absolute positioning */
-.t-timeline .t-timeline-hours {
-  position: relative;
-  height: 16px;
 }
 
 /* Project legend */
