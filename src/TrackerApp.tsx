@@ -417,7 +417,7 @@ export default function TrackerApp() {
       const mouseRatio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
       const mouseHour = r[0] + mouseRatio * (r[1] - r[0])
       const zoomFactor = e.deltaY > 0 ? 1.15 : 0.85
-      const newSpan = Math.max(1, Math.min(24, (r[1] - r[0]) * zoomFactor))
+      const newSpan = Math.max(0.25, Math.min(24, (r[1] - r[0]) * zoomFactor))
       let newStart = mouseHour - mouseRatio * newSpan
       let newEnd = mouseHour + (1 - mouseRatio) * newSpan
       if (newStart < 0) { newEnd -= newStart; newStart = 0 }
@@ -1544,24 +1544,26 @@ export default function TrackerApp() {
 
                     // Ruler tick generation
                     const rulerTicks: { h: number; major: boolean }[] = []
-                    const step = rangeDuration <= 120 ? 0.5 : rangeDuration <= 360 ? 1 : rangeDuration <= 720 ? 1 : 1
-                    const labelStep = rangeDuration <= 120 ? 1 : rangeDuration <= 360 ? 1 : rangeDuration <= 720 ? 2 : 3
+                    const step = rangeDuration <= 30 ? 0.25 : rangeDuration <= 60 ? 0.25 : rangeDuration <= 120 ? 0.5 : rangeDuration <= 360 ? 1 : 1
+                    const labelStep = rangeDuration <= 30 ? 0.25 : rangeDuration <= 60 ? 0.5 : rangeDuration <= 120 ? 1 : rangeDuration <= 360 ? 1 : rangeDuration <= 720 ? 2 : 3
                     for (let h = Math.ceil(dayRange[0] / step) * step; h <= dayRange[1]; h += step) {
-                      rulerTicks.push({ h, major: h % labelStep === 0 && h === Math.floor(h) })
+                      rulerTicks.push({ h, major: Math.abs(h % labelStep) < 0.01 || Math.abs(h % labelStep - labelStep) < 0.01 })
                     }
 
                     const handleMouseDown = (e: React.MouseEvent) => {
-                      if (dayRange[0] === 0 && dayRange[1] === 24) return
+                      const r = dayRangeRef.current
+                      if (r[0] === 0 && r[1] === 24) return
+                      e.preventDefault()
                       setIsDraggingTimeline(true)
-                      setDragStartX(e.clientX)
-                      setDragStartRange([...dayRange] as [number, number])
+                      const startX = e.clientX
+                      const startRange: [number, number] = [r[0], r[1]]
+                      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+                      const hoursPerPx = (startRange[1] - startRange[0]) / rect.width
                       const handleMouseMove = (ev: MouseEvent) => {
-                        const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
-                        const dx = ev.clientX - e.clientX
-                        const hoursPerPx = (dayRange[1] - dayRange[0]) / rect.width
+                        const dx = ev.clientX - startX
                         const shift = -dx * hoursPerPx
-                        let s = dragStartRange[0] + shift
-                        let en = dragStartRange[1] + shift
+                        let s = startRange[0] + shift
+                        let en = startRange[1] + shift
                         if (s < 0) { en -= s; s = 0 }
                         if (en > 24) { s -= (en - 24); en = 24 }
                         setDayRange([Math.max(0, s), Math.min(24, en)])
@@ -1586,7 +1588,7 @@ export default function TrackerApp() {
                         </div>
                         <div
                           ref={timelineRefCallback}
-                          className={`t-timeline t-timeline-zoomable${isDraggingTimeline ? ' dragging' : ''}`}
+                          className={`t-timeline t-timeline-zoomable${isDraggingTimeline ? ' dragging' : dayRange[0] !== 0 || dayRange[1] !== 24 ? ' zoomed' : ''}`}
                           onMouseDown={handleMouseDown}
                         >
                           {/* Ruler */}
@@ -1597,7 +1599,7 @@ export default function TrackerApp() {
                                 className={`t-ruler-tick${major ? ' major' : ''}`}
                                 style={{ left: `${((h * 60 - rangeStartMin) / rangeDuration) * 100}%` }}
                               >
-                                {major && <span className="t-ruler-label">{h}</span>}
+                                {major && <span className="t-ruler-label">{h === Math.floor(h) ? `${h}` : `${Math.floor(h)}:${Math.round((h % 1) * 60).toString().padStart(2, '0')}`}</span>}
                               </div>
                             ))}
                           </div>

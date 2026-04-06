@@ -1157,6 +1157,10 @@
   user-select: none;
 }
 
+.t-timeline-zoomable.zoomed {
+  cursor: grab;
+}
+
 .t-timeline-zoomable.dragging {
   cursor: grabbing;
 }
