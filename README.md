@@ -5,27 +5,22 @@ A local-first knowledge base viewer + work tracker with Claude Code usage analyt
 ## Features
 
 ### Knowledge Base
-- Markdown viewer/editor with live preview, Mermaid diagrams, and CodeMirror
-- Multi-directory support — add folders via native Finder picker or manual path
-- Widget system: companion `.tsx` files inject interactive ECharts visualizations
-- Light/dark mode with warm, low-saturation palette
+
+Markdown viewer/editor with live preview, Mermaid diagrams, CodeMirror, multi-directory support, and an interactive widget system.
+
+![Knowledge Base](pictureforreadme/knowledgebase.png)
 
 ### Work Tracker
-- GitHub activity monitoring — commits and PRs across tracked repos
-- Date range views (today, week, month, custom calendar picker)
-- Workload charts with per-repo breakdown
+
+GitHub activity monitoring — commits and PRs across tracked repos with workload charts, date range views, and calendar picker.
+
+![Work Tracker](pictureforreadme/worktracker-commit.png)
 
 ### Claude Code Usage
-- **Stats overview** — sessions, messages, output tokens, estimated cost (from `~/.claude/stats-cache.json`)
-- **Contribution heatmap** — GitHub-style calendar showing daily message activity
-- **Token usage by model** — stacked bar chart (last 30 days)
-- **Activity Timeline** — real-time tracking via Claude Code Stop hook
-  - **Day view** — zoomable 24h ruler (scroll to zoom, drag to pan, 15min granularity)
-  - **Week view** — 7-day activity tracks with per-day durations
-  - **Month view** — daily hours line chart
-  - **Projects view** — horizontal bar chart of hours per project
-  - Color-coded by project with legend
-- **Model breakdown** — per-model tokens + estimated cost
+
+Stats overview, contribution heatmap, token usage by model, activity timeline (day/week/month/projects), and model cost breakdown — all powered by `~/.claude/stats-cache.json` and real-time Stop hooks.
+
+![Claude Usage](pictureforreadme/claude-usage.png)
 
 ## Setup
 
