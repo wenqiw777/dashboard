@@ -427,9 +427,13 @@
   border: 1px solid var(--border-light);
   border-radius: var(--radius-md);
   margin-bottom: 20px;
-  overflow: hidden;
   box-shadow: var(--shadow-sm);
   animation: t-slideDown 200ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.t-chart-card .t-cal-wrapper .t-calendar {
+  left: auto;
+  right: 0;
 }
 
 .t-chart-header {
