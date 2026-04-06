@@ -402,17 +402,19 @@ export default function TrackerApp() {
     return () => document.removeEventListener('mousedown', handler)
   }, [showCalendar])
 
-  // Non-passive wheel handler for timeline zoom
+  // Non-passive wheel handler for timeline zoom (via callback ref)
   const dayRangeRef = useRef(dayRange)
   dayRangeRef.current = dayRange
-  useEffect(() => {
-    const el = timelineZoomRef.current
-    if (!el) return
-    const handler = (e: WheelEvent) => {
+  const wheelHandlerRef = useRef<((e: WheelEvent) => void) | null>(null)
+  if (!wheelHandlerRef.current) {
+    wheelHandlerRef.current = (e: WheelEvent) => {
       e.preventDefault()
+      e.stopPropagation()
+      const el = timelineZoomRef.current
+      if (!el) return
       const rect = el.getBoundingClientRect()
       const r = dayRangeRef.current
-      const mouseRatio = (e.clientX - rect.left) / rect.width
+      const mouseRatio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
       const mouseHour = r[0] + mouseRatio * (r[1] - r[0])
       const zoomFactor = e.deltaY > 0 ? 1.15 : 0.85
       const newSpan = Math.max(1, Math.min(24, (r[1] - r[0]) * zoomFactor))
@@ -422,9 +424,18 @@ export default function TrackerApp() {
       if (newEnd > 24) { newStart -= (newEnd - 24); newEnd = 24 }
       setDayRange([Math.max(0, newStart), Math.min(24, newEnd)])
     }
-    el.addEventListener('wheel', handler, { passive: false })
-    return () => el.removeEventListener('wheel', handler)
-  }, [activityView])
+  }
+  const timelineRefCallback = useCallback((node: HTMLDivElement | null) => {
+    // Detach from old node
+    if (timelineZoomRef.current && wheelHandlerRef.current) {
+      timelineZoomRef.current.removeEventListener('wheel', wheelHandlerRef.current)
+    }
+    timelineZoomRef.current = node
+    // Attach to new node
+    if (node && wheelHandlerRef.current) {
+      node.addEventListener('wheel', wheelHandlerRef.current, { passive: false })
+    }
+  }, [])
 
   // Close activity calendar on click outside
   useEffect(() => {
@@ -1533,8 +1544,8 @@ export default function TrackerApp() {
 
                     // Ruler tick generation
                     const rulerTicks: { h: number; major: boolean }[] = []
-                    const step = rangeDuration <= 120 ? 0.5 : rangeDuration <= 360 ? 1 : rangeDuration <= 720 ? 2 : 3
-                    const labelStep = rangeDuration <= 120 ? 1 : rangeDuration <= 360 ? 2 : rangeDuration <= 720 ? 3 : 6
+                    const step = rangeDuration <= 120 ? 0.5 : rangeDuration <= 360 ? 1 : rangeDuration <= 720 ? 1 : 1
+                    const labelStep = rangeDuration <= 120 ? 1 : rangeDuration <= 360 ? 1 : rangeDuration <= 720 ? 2 : 3
                     for (let h = Math.ceil(dayRange[0] / step) * step; h <= dayRange[1]; h += step) {
                       rulerTicks.push({ h, major: h % labelStep === 0 && h === Math.floor(h) })
                     }
@@ -1574,7 +1585,7 @@ export default function TrackerApp() {
                           )}
                         </div>
                         <div
-                          ref={timelineZoomRef}
+                          ref={timelineRefCallback}
                           className={`t-timeline t-timeline-zoomable${isDraggingTimeline ? ' dragging' : ''}`}
                           onMouseDown={handleMouseDown}
                         >
