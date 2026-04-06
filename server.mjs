@@ -499,4 +499,62 @@ app.get('/api/claude-stats', async (_req, res) => {
   }
 });
 
+// --- Claude Hourly Token Tracking ---
+const HOURLY_FILE = path.join(DATA_DIR, 'claude-hourly.json');
+if (!existsSync(HOURLY_FILE)) writeFileSync(HOURLY_FILE, '{"snapshots":[],"lastTotals":null}');
+
+async function snapshotClaudeUsage() {
+  try {
+    const statsPath = path.join(os.homedir(), '.claude', 'stats-cache.json');
+    const stats = JSON.parse(await fs.readFile(statsPath, 'utf-8'));
+    const hourly = JSON.parse(await fs.readFile(HOURLY_FILE, 'utf-8'));
+
+    // Current totals
+    const now = {
+      messages: stats.totalMessages || 0,
+      sessions: stats.totalSessions || 0,
+      tokensByModel: {},
+    };
+    for (const [model, u] of Object.entries(stats.modelUsage || {})) {
+      now.tokensByModel[model] = (u.inputTokens || 0) + (u.outputTokens || 0) + (u.cacheReadInputTokens || 0) + (u.cacheCreationInputTokens || 0);
+    }
+
+    const prev = hourly.lastTotals;
+    if (prev) {
+      // Compute deltas
+      const dMessages = now.messages - (prev.messages || 0);
+      const dSessions = now.sessions - (prev.sessions || 0);
+      const dTokens = {};
+      for (const [model, total] of Object.entries(now.tokensByModel)) {
+        const delta = total - (prev.tokensByModel?.[model] || 0);
+        if (delta > 0) dTokens[model] = delta;
+      }
+
+      // Only record if there's actual activity
+      if (dMessages > 0 || Object.values(dTokens).some(v => v > 0)) {
+        const ts = new Date().toISOString();
+        hourly.snapshots.push({ ts, messages: dMessages, sessions: dSessions, tokensByModel: dTokens });
+        // Keep max 90 days of data (~2160 entries at 1/hr)
+        if (hourly.snapshots.length > 2200) hourly.snapshots = hourly.snapshots.slice(-2160);
+      }
+    }
+
+    hourly.lastTotals = now;
+    await writeJSON(HOURLY_FILE, hourly);
+  } catch { /* silent — stats file may not exist */ }
+}
+
+// Snapshot every 10 minutes for finer granularity
+snapshotClaudeUsage();
+setInterval(snapshotClaudeUsage, 10 * 60 * 1000);
+
+app.get('/api/claude-hourly', async (_req, res) => {
+  try {
+    const data = JSON.parse(await fs.readFile(HOURLY_FILE, 'utf-8'));
+    res.json(data.snapshots || []);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.listen(8000, () => console.log('API server on :8000'));

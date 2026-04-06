@@ -77,6 +77,13 @@ interface ClaudeStats {
   firstSessionDate: string
 }
 
+interface HourlySnapshot {
+  ts: string
+  messages: number
+  sessions: number
+  tokensByModel: Record<string, number>
+}
+
 // Claude logo icon
 function ClaudeIcon({ size = 14 }: { size?: number }) {
   return (
@@ -257,14 +264,20 @@ export default function TrackerApp() {
   // Full month data for chart + calendar dots
   const [monthActivity, setMonthActivity] = useState<RepoActivity[]>([])
   const [claudeStats, setClaudeStats] = useState<ClaudeStats | null>(null)
+  const [hourlySnapshots, setHourlySnapshots] = useState<HourlySnapshot[]>([])
+  const [hourlyDate, setHourlyDate] = useState(() => { const d = new Date(); return d.toISOString().slice(0, 10) })
   const [heatmapTooltip, setHeatmapTooltip] = useState<{ text: string; x: number; y: number } | null>(null)
   const heatmapRef = useRef<HTMLDivElement>(null)
   const calendarRef = useRef<HTMLDivElement>(null)
 
   const loadClaudeStats = useCallback(async () => {
     try {
-      const res = await fetch('/api/claude-stats')
-      if (res.ok) setClaudeStats(await res.json())
+      const [statsRes, hourlyRes] = await Promise.all([
+        fetch('/api/claude-stats'),
+        fetch('/api/claude-hourly'),
+      ])
+      if (statsRes.ok) setClaudeStats(await statsRes.json())
+      if (hourlyRes.ok) setHourlySnapshots(await hourlyRes.json())
     } catch { /* silent */ }
   }, [])
 
@@ -636,6 +649,100 @@ export default function TrackerApp() {
       }],
     }
   }, [claudeStats])
+
+  // Hourly token chart for selected day
+  const hourlyDayChart = useMemo(() => {
+    if (!hourlySnapshots.length) return null
+    const root = document.documentElement
+    const cs = getComputedStyle(root)
+    const resolve = (v: string) => { const m = v.match(/var\((.+)\)/); return m ? cs.getPropertyValue(m[1]).trim() || '#888' : v }
+
+    // Filter snapshots for selected date
+    const daySnapshots = hourlySnapshots.filter(s => s.ts.startsWith(hourlyDate))
+
+    // Bucket into hours, accumulate tokens per model
+    const hourBuckets: Record<number, Record<string, number>> = {}
+    const hourMessages: Record<number, number> = {}
+    for (let h = 0; h < 24; h++) { hourBuckets[h] = {}; hourMessages[h] = 0 }
+
+    for (const snap of daySnapshots) {
+      const h = new Date(snap.ts).getHours()
+      hourMessages[h] += snap.messages
+      for (const [model, tokens] of Object.entries(snap.tokensByModel)) {
+        hourBuckets[h][model] = (hourBuckets[h][model] || 0) + tokens
+      }
+    }
+
+    // Collect all models seen this day
+    const modelSet = new Set<string>()
+    for (const bucket of Object.values(hourBuckets)) for (const m of Object.keys(bucket)) modelSet.add(m)
+    const models = [...modelSet]
+
+    if (models.length === 0) return null
+
+    const modelColors: Record<string, string> = {
+      'claude-opus-4-6': '#D97757',
+      'claude-opus-4-5-20251101': '#C65D33',
+      'claude-sonnet-4-6': '#E8A87C',
+      'claude-sonnet-4-5-20250929': '#B8856C',
+      'claude-haiku-4-5-20251001': '#F0C4A8',
+    }
+    const shortName = (m: string) => {
+      if (m.includes('opus-4-6')) return 'Opus 4.6'
+      if (m.includes('opus-4-5')) return 'Opus 4.5'
+      if (m.includes('sonnet-4-6')) return 'Sonnet 4.6'
+      if (m.includes('sonnet-4-5')) return 'Sonnet 4.5'
+      if (m.includes('haiku')) return 'Haiku 4.5'
+      return m
+    }
+
+    const hours = Array.from({ length: 24 }, (_, i) => i)
+    const totalTokens = Object.values(hourBuckets).reduce((s, b) => s + Object.values(b).reduce((a, v) => a + v, 0), 0)
+    const totalMsgs = Object.values(hourMessages).reduce((a, b) => a + b, 0)
+
+    return {
+      totalTokens,
+      totalMessages: totalMsgs,
+      chart: {
+        grid: { left: 56, right: 12, top: 30, bottom: 28 },
+        tooltip: {
+          trigger: 'axis' as const,
+          backgroundColor: resolve('var(--bg-card)'),
+          borderColor: resolve('var(--border)'),
+          textStyle: { color: resolve('var(--text-primary)'), fontSize: 12 },
+          valueFormatter: (v: number) => v >= 1_000_000 ? `${(v / 1_000_000).toFixed(1)}M` : v >= 1000 ? `${(v / 1000).toFixed(1)}k` : String(v),
+        },
+        legend: {
+          top: 0, right: 0,
+          textStyle: { color: resolve('var(--text-muted)'), fontSize: 11 },
+          itemWidth: 10, itemHeight: 10,
+        },
+        xAxis: {
+          type: 'category' as const,
+          data: hours.map(h => `${h}:00`),
+          axisLabel: { color: resolve('var(--text-muted)'), fontSize: 10, interval: 2 },
+          axisLine: { lineStyle: { color: resolve('var(--border-light)') } },
+          axisTick: { show: false },
+        },
+        yAxis: {
+          type: 'value' as const,
+          axisLabel: { color: resolve('var(--text-muted)'), fontSize: 10, formatter: (v: number) => v >= 1_000_000 ? `${(v / 1_000_000).toFixed(1)}M` : v >= 1000 ? `${(v / 1000).toFixed(0)}k` : String(v) },
+          splitLine: { lineStyle: { color: resolve('var(--border-light)'), type: 'dashed' as const } },
+        },
+        series: models.map((m, i) => ({
+          name: shortName(m),
+          type: 'bar' as const,
+          stack: 'tokens',
+          barWidth: '60%',
+          itemStyle: {
+            color: modelColors[m] || `hsl(${20 + i * 15}, 70%, 55%)`,
+            borderRadius: i === models.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0],
+          },
+          data: hours.map(h => Object.entries(hourBuckets[h]).filter(([k]) => k === m).reduce((s, [, v]) => s + v, 0)),
+        })),
+      },
+    }
+  }, [hourlySnapshots, hourlyDate])
 
   const activeRepos = activity.filter(a => a.commits.length > 0)
   const totalCommits = activity.reduce((sum, a) => sum + a.commits.length, 0)
@@ -1175,16 +1282,52 @@ export default function TrackerApp() {
                 </div>
               )}
 
-              {/* Usage by Hour */}
+              {/* Usage by Hour (all time) */}
               {claudeHourChart && (
                 <div className="t-chart-card">
                   <div className="t-chart-header">
                     <Clock size={14} />
-                    <span>Sessions by Hour of Day</span>
+                    <span>Sessions by Hour of Day (All Time)</span>
                   </div>
                   <ReactEChartsCore echarts={echarts} option={claudeHourChart} style={{ height: 160 }} notMerge />
                 </div>
               )}
+
+              {/* Hourly Token Tracking for specific day */}
+              <div className="t-chart-card">
+                <div className="t-chart-header">
+                  <Zap size={14} />
+                  <span>Hourly Token Usage</span>
+                  <div className="t-hourly-date-nav">
+                    <button className="t-hourly-nav-btn" onClick={() => {
+                      const d = new Date(hourlyDate + 'T00:00:00'); d.setDate(d.getDate() - 1); setHourlyDate(d.toISOString().slice(0, 10))
+                    }}><ChevronLeft size={14} /></button>
+                    <input type="date" className="t-hourly-date-input" value={hourlyDate}
+                      onChange={e => setHourlyDate(e.target.value)}
+                      max={new Date().toISOString().slice(0, 10)} />
+                    <button className="t-hourly-nav-btn" onClick={() => {
+                      const d = new Date(hourlyDate + 'T00:00:00'); d.setDate(d.getDate() + 1)
+                      const today = new Date().toISOString().slice(0, 10)
+                      if (d.toISOString().slice(0, 10) <= today) setHourlyDate(d.toISOString().slice(0, 10))
+                    }}><ChevronRight size={14} /></button>
+                  </div>
+                </div>
+                {hourlyDayChart ? (
+                  <>
+                    <div className="t-hourly-summary">
+                      {hourlyDayChart.totalTokens >= 1_000_000
+                        ? `${(hourlyDayChart.totalTokens / 1_000_000).toFixed(1)}M`
+                        : `${(hourlyDayChart.totalTokens / 1000).toFixed(0)}k`} tokens · {hourlyDayChart.totalMessages} messages
+                    </div>
+                    <ReactEChartsCore echarts={echarts} option={hourlyDayChart.chart} style={{ height: 200 }} notMerge />
+                  </>
+                ) : (
+                  <div className="t-hourly-empty">
+                    No hourly data for {new Date(hourlyDate + 'T00:00:00').toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })}
+                    <span className="t-hourly-empty-hint">Tracking starts when the server runs — data builds up over time</span>
+                  </div>
+                )}
+              </div>
 
               {/* Model Breakdown */}
               <div className="t-chart-card">
