@@ -694,44 +694,43 @@ export default function TrackerApp() {
     }
   }, [claudeStats])
 
-  // Build activity blocks from pings with global gap detection
-  // 30min without ANY ping across ALL sessions = split
+  // Build continuous activity blocks — each slice runs from one ping to the next,
+  // colored by project. Only gaps > 30min create visual breaks.
   const GAP_MS = 30 * 60 * 1000
   const buildBlocks = useCallback((pings: ClaudePing[]) => {
     if (!pings.length) return []
-    // Sort all pings chronologically
     const sorted = [...pings].sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime())
 
-    // Find global activity segments (split when no pings for 30min)
-    const segments: ClaudePing[][] = [[sorted[0]]]
-    for (let i = 1; i < sorted.length; i++) {
-      const gap = new Date(sorted[i].ts).getTime() - new Date(sorted[i - 1].ts).getTime()
-      if (gap > GAP_MS) {
-        segments.push([sorted[i]])
-      } else {
-        segments[segments.length - 1].push(sorted[i])
-      }
-    }
-
-    // Within each segment, create per-project blocks
     const blocks: { start: Date; end: Date; project: string; turns: number }[] = []
-    for (const seg of segments) {
-      const byProject = new Map<string, Date[]>()
-      for (const p of seg) {
-        if (!byProject.has(p.project)) byProject.set(p.project, [])
-        byProject.get(p.project)!.push(new Date(p.ts))
-      }
-      for (const [project, times] of byProject) {
-        times.sort((a, b) => a.getTime() - b.getTime())
-        blocks.push({
-          start: times[0],
-          end: times[times.length - 1],
-          project,
-          turns: times.length,
-        })
+    let blockStart = new Date(sorted[0].ts)
+    let blockProject = sorted[0].project
+    let blockTurns = 1
+
+    for (let i = 1; i < sorted.length; i++) {
+      const prevTime = new Date(sorted[i - 1].ts).getTime()
+      const currTime = new Date(sorted[i].ts).getTime()
+      const gap = currTime - prevTime
+      const currProject = sorted[i].project
+
+      if (gap > GAP_MS) {
+        // Big gap — close current block, start new one
+        blocks.push({ start: blockStart, end: new Date(prevTime), project: blockProject, turns: blockTurns })
+        blockStart = new Date(currTime)
+        blockProject = currProject
+        blockTurns = 1
+      } else if (currProject !== blockProject) {
+        // Project changed — close current block at this ping's time, start new with same time (no gap)
+        blocks.push({ start: blockStart, end: new Date(currTime), project: blockProject, turns: blockTurns })
+        blockStart = new Date(currTime)
+        blockProject = currProject
+        blockTurns = 1
+      } else {
+        blockTurns++
       }
     }
-    blocks.sort((a, b) => a.start.getTime() - b.start.getTime())
+    // Close last block
+    blocks.push({ start: blockStart, end: new Date(sorted[sorted.length - 1].ts), project: blockProject, turns: blockTurns })
+
     return blocks
   }, [])
 
