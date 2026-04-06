@@ -409,11 +409,11 @@ export default function TrackerApp() {
     return map
   }, [monthActivity])
 
-  // Pings by date (for activity calendar dots)
+  // Pings by date (for activity calendar dots) — use local date
   const pingsByDate = useMemo(() => {
     const map = new Map<string, number>()
     for (const p of claudePings) {
-      const key = p.ts.slice(0, 10)
+      const key = toDateKey(new Date(p.ts))
       map.set(key, (map.get(key) || 0) + 1)
     }
     return map
@@ -674,44 +674,59 @@ export default function TrackerApp() {
     }
   }, [claudeStats])
 
-  // Activity timeline from pings — shows active sessions as time blocks
-  const activityTimeline = useMemo(() => {
-    if (!claudePings.length) return null
-    const dayPings = claudePings.filter(p => p.ts.startsWith(activityDate))
-    if (!dayPings.length) return null
-
-    // Group pings by session
-    const sessions = new Map<string, { pings: ClaudePing[], project: string }>()
-    for (const p of dayPings) {
+  // Build activity blocks from pings with gap detection (30min gap = new block)
+  const GAP_MS = 30 * 60 * 1000
+  const buildBlocks = useCallback((pings: ClaudePing[]) => {
+    // Group by session
+    const sessions = new Map<string, { pings: ClaudePing[]; project: string }>()
+    for (const p of pings) {
       if (!sessions.has(p.session)) sessions.set(p.session, { pings: [], project: p.project })
       sessions.get(p.session)!.pings.push(p)
     }
 
-    // Build session blocks: first ping → last ping per session
     const blocks: { start: Date; end: Date; project: string; turns: number }[] = []
     for (const [, s] of sessions) {
       const times = s.pings.map(p => new Date(p.ts).getTime()).sort((a, b) => a - b)
-      blocks.push({
-        start: new Date(times[0]),
-        end: new Date(times[times.length - 1]),
-        project: s.project,
-        turns: s.pings.length,
-      })
+      // Split into segments if gap > 30 min
+      let segStart = 0
+      for (let i = 1; i <= times.length; i++) {
+        if (i === times.length || times[i] - times[i - 1] > GAP_MS) {
+          blocks.push({
+            start: new Date(times[segStart]),
+            end: new Date(times[i - 1]),
+            project: s.project,
+            turns: i - segStart,
+          })
+          segStart = i
+        }
+      }
     }
     blocks.sort((a, b) => a.start.getTime() - b.start.getTime())
+    return blocks
+  }, [])
 
-    // Total active time (sum of session durations, min 1 min per session)
+  // Filter pings by local date (not UTC)
+  const filterPingsByDate = useCallback((pings: ClaudePing[], dateKey: string) => {
+    return pings.filter(p => toDateKey(new Date(p.ts)) === dateKey)
+  }, [])
+
+  // Activity timeline from pings — shows active sessions as time blocks
+  const activityTimeline = useMemo(() => {
+    if (!claudePings.length) return null
+    const dayPings = filterPingsByDate(claudePings, activityDate)
+    if (!dayPings.length) return null
+
+    const blocks = buildBlocks(dayPings)
     const totalMinutes = blocks.reduce((s, b) => s + Math.max(1, (b.end.getTime() - b.start.getTime()) / 60000), 0)
-    const totalTurns = dayPings.length
+    const sessionCount = new Set(dayPings.map(p => p.session)).size
 
-    return { blocks, totalMinutes, totalTurns, sessionCount: sessions.size }
-  }, [claudePings, activityDate])
+    return { blocks, totalMinutes, totalTurns: dayPings.length, sessionCount }
+  }, [claudePings, activityDate, buildBlocks, filterPingsByDate])
 
   // Week view: 7 days of activity tracks
   const activityWeek = useMemo(() => {
     if (!claudePings.length) return null
     const baseDate = new Date(activityDate + 'T00:00:00')
-    // Start from Monday of the week containing activityDate
     const dayOfWeek = baseDate.getDay()
     const monday = new Date(baseDate)
     monday.setDate(monday.getDate() - ((dayOfWeek + 6) % 7))
@@ -722,28 +737,15 @@ export default function TrackerApp() {
       const d = new Date(monday)
       d.setDate(d.getDate() + i)
       const key = toDateKey(d)
-      const dayPings = claudePings.filter(p => p.ts.startsWith(key))
-
-      const sessions = new Map<string, { pings: ClaudePing[]; project: string }>()
-      for (const p of dayPings) {
-        if (!sessions.has(p.session)) sessions.set(p.session, { pings: [], project: p.project })
-        sessions.get(p.session)!.pings.push(p)
-      }
-
-      const blocks: { start: Date; end: Date; project: string; turns: number }[] = []
-      for (const [, s] of sessions) {
-        const times = s.pings.map(p => new Date(p.ts).getTime()).sort((a, b) => a - b)
-        blocks.push({ start: new Date(times[0]), end: new Date(times[times.length - 1]), project: s.project, turns: s.pings.length })
-      }
-      blocks.sort((a, b) => a.start.getTime() - b.start.getTime())
-
+      const dayPings = filterPingsByDate(claudePings, key)
+      const blocks = buildBlocks(dayPings)
       const totalMinutes = blocks.reduce((s, b) => s + Math.max(1, (b.end.getTime() - b.start.getTime()) / 60000), 0)
       days.push({ date: key, label: d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }), blocks, totalMinutes, turns: dayPings.length })
     }
 
     const weekTotal = days.reduce((s, d) => s + d.totalMinutes, 0)
     return { days, weekTotal }
-  }, [claudePings, activityDate])
+  }, [claudePings, activityDate, buildBlocks, filterPingsByDate])
 
   // Month view: daily hours line chart
   const activityMonthChart = useMemo(() => {
@@ -761,20 +763,9 @@ export default function TrackerApp() {
     for (let d = 1; d <= daysInMonth; d++) {
       const date = new Date(year, month, d)
       const key = toDateKey(date)
-      const dayPings = claudePings.filter(p => p.ts.startsWith(key))
-
-      const sessions = new Map<string, ClaudePing[]>()
-      for (const p of dayPings) {
-        if (!sessions.has(p.session)) sessions.set(p.session, [])
-        sessions.get(p.session)!.push(p)
-      }
-
-      let minutes = 0
-      for (const pings of sessions.values()) {
-        const times = pings.map(p => new Date(p.ts).getTime()).sort((a, b) => a - b)
-        minutes += Math.max(1, (times[times.length - 1] - times[0]) / 60000)
-      }
-
+      const dayPings = filterPingsByDate(claudePings, key)
+      const blocks = buildBlocks(dayPings)
+      const minutes = blocks.reduce((s, b) => s + Math.max(1, (b.end.getTime() - b.start.getTime()) / 60000), 0)
       dailyHours.push({ date: key, label: `${d}`, hours: minutes / 60, turns: dayPings.length })
     }
 
@@ -825,7 +816,7 @@ export default function TrackerApp() {
         }],
       },
     }
-  }, [claudePings, activityDate])
+  }, [claudePings, activityDate, buildBlocks, filterPingsByDate])
 
   // Project stats: bar chart of hours per project
   const activityProjectChart = useMemo(() => {
@@ -834,26 +825,19 @@ export default function TrackerApp() {
     const cs = getComputedStyle(root)
     const resolve = (v: string) => { const m = v.match(/var\((.+)\)/); return m ? cs.getPropertyValue(m[1]).trim() || '#888' : v }
 
-    // Group all pings by project → sessions → compute time
-    const projectMinutes = new Map<string, number>()
+    // Group pings by project, compute time with gap detection
+    const projectPings = new Map<string, ClaudePing[]>()
     const projectTurns = new Map<string, number>()
-
-    // Group by project+session
-    const projectSessions = new Map<string, Map<string, ClaudePing[]>>()
     for (const p of claudePings) {
-      if (!projectSessions.has(p.project)) projectSessions.set(p.project, new Map())
-      const sessions = projectSessions.get(p.project)!
-      if (!sessions.has(p.session)) sessions.set(p.session, [])
-      sessions.get(p.session)!.push(p)
+      if (!projectPings.has(p.project)) projectPings.set(p.project, [])
+      projectPings.get(p.project)!.push(p)
       projectTurns.set(p.project, (projectTurns.get(p.project) || 0) + 1)
     }
 
-    for (const [project, sessions] of projectSessions) {
-      let totalMin = 0
-      for (const pings of sessions.values()) {
-        const times = pings.map(p => new Date(p.ts).getTime()).sort((a, b) => a - b)
-        totalMin += Math.max(1, (times[times.length - 1] - times[0]) / 60000)
-      }
+    const projectMinutes = new Map<string, number>()
+    for (const [project, pings] of projectPings) {
+      const blocks = buildBlocks(pings)
+      const totalMin = blocks.reduce((s, b) => s + Math.max(1, (b.end.getTime() - b.start.getTime()) / 60000), 0)
       projectMinutes.set(project, totalMin)
     }
 
@@ -897,7 +881,7 @@ export default function TrackerApp() {
         }],
       },
     }
-  }, [claudePings])
+  }, [claudePings, buildBlocks])
 
   const activeRepos = activity.filter(a => a.commits.length > 0)
   const totalCommits = activity.reduce((sum, a) => sum + a.commits.length, 0)
