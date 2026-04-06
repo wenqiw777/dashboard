@@ -544,14 +544,45 @@ async function snapshotClaudeUsage() {
   } catch { /* silent — stats file may not exist */ }
 }
 
-// Snapshot every 10 minutes for finer granularity
+// Snapshot every 1 minute for near-realtime tracking
 snapshotClaudeUsage();
-setInterval(snapshotClaudeUsage, 10 * 60 * 1000);
+setInterval(snapshotClaudeUsage, 60 * 1000);
 
 app.get('/api/claude-hourly', async (_req, res) => {
   try {
     const data = JSON.parse(await fs.readFile(HOURLY_FILE, 'utf-8'));
     res.json(data.snapshots || []);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Claude Activity Pings (from hooks) ---
+const PINGS_FILE = path.join(DATA_DIR, 'claude-pings.json');
+if (!existsSync(PINGS_FILE)) writeFileSync(PINGS_FILE, '[]');
+
+app.post('/api/claude-ping', async (req, res) => {
+  try {
+    const { session_id, stop_reason, model } = req.body;
+    const pings = JSON.parse(await fs.readFile(PINGS_FILE, 'utf-8'));
+    pings.push({
+      ts: new Date().toISOString(),
+      session_id: session_id || 'unknown',
+      model: model || 'unknown',
+      stop_reason: stop_reason || 'end_turn',
+    });
+    // Keep last 90 days (~keep generous, trim if > 50k)
+    if (pings.length > 50000) pings.splice(0, pings.length - 50000);
+    await writeJSON(PINGS_FILE, pings);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/claude-pings', async (_req, res) => {
+  try {
+    res.json(JSON.parse(await fs.readFile(PINGS_FILE, 'utf-8')));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

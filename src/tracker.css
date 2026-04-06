@@ -1088,6 +1088,50 @@
   opacity: 0.6;
 }
 
+/* Activity Timeline */
+.t-timeline {
+  padding: 8px 16px 16px;
+}
+
+.t-timeline-hours {
+  display: flex;
+  justify-content: space-between;
+  padding: 0 0 4px;
+}
+
+.t-timeline-hour-label {
+  font-size: 0.6rem;
+  color: var(--text-muted);
+  opacity: 0.6;
+  width: calc(100% / 24);
+  text-align: center;
+}
+
+.t-timeline-track {
+  position: relative;
+  height: 28px;
+  background: var(--bg-secondary);
+  border-radius: 6px;
+  border: 1px solid var(--border-light);
+  overflow: hidden;
+}
+
+.t-timeline-block {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  background: #D97757;
+  border-radius: 4px;
+  min-width: 4px;
+  cursor: default;
+  opacity: 0.85;
+  transition: opacity 0.15s;
+}
+
+.t-timeline-block:hover {
+  opacity: 1;
+}
+
 /* Animations */
 @keyframes t-spin {
   to { transform: rotate(360deg); }

@@ -84,6 +84,13 @@ interface HourlySnapshot {
   tokensByModel: Record<string, number>
 }
 
+interface ClaudePing {
+  ts: string
+  session_id: string
+  model: string
+  stop_reason: string
+}
+
 // Claude logo icon
 function ClaudeIcon({ size = 14 }: { size?: number }) {
   return (
@@ -265,6 +272,7 @@ export default function TrackerApp() {
   const [monthActivity, setMonthActivity] = useState<RepoActivity[]>([])
   const [claudeStats, setClaudeStats] = useState<ClaudeStats | null>(null)
   const [hourlySnapshots, setHourlySnapshots] = useState<HourlySnapshot[]>([])
+  const [claudePings, setClaudePings] = useState<ClaudePing[]>([])
   const [hourlyDate, setHourlyDate] = useState(() => { const d = new Date(); return d.toISOString().slice(0, 10) })
   const [showHourlyCal, setShowHourlyCal] = useState(false)
   const [heatmapTooltip, setHeatmapTooltip] = useState<{ text: string; x: number; y: number } | null>(null)
@@ -274,12 +282,14 @@ export default function TrackerApp() {
 
   const loadClaudeStats = useCallback(async () => {
     try {
-      const [statsRes, hourlyRes] = await Promise.all([
+      const [statsRes, hourlyRes, pingsRes] = await Promise.all([
         fetch('/api/claude-stats'),
         fetch('/api/claude-hourly'),
+        fetch('/api/claude-pings'),
       ])
       if (statsRes.ok) setClaudeStats(await statsRes.json())
       if (hourlyRes.ok) setHourlySnapshots(await hourlyRes.json())
+      if (pingsRes.ok) setClaudePings(await pingsRes.json())
     } catch { /* silent */ }
   }, [])
 
@@ -768,6 +778,39 @@ export default function TrackerApp() {
       },
     }
   }, [hourlySnapshots, hourlyDate])
+
+  // Activity timeline from pings — shows active sessions as time blocks
+  const activityTimeline = useMemo(() => {
+    if (!claudePings.length) return null
+    const dayPings = claudePings.filter(p => p.ts.startsWith(hourlyDate))
+    if (!dayPings.length) return null
+
+    // Group pings by session
+    const sessions = new Map<string, { pings: ClaudePing[], model: string }>()
+    for (const p of dayPings) {
+      if (!sessions.has(p.session_id)) sessions.set(p.session_id, { pings: [], model: p.model })
+      sessions.get(p.session_id)!.pings.push(p)
+    }
+
+    // Build session blocks: first ping → last ping per session
+    const blocks: { start: Date; end: Date; model: string; turns: number }[] = []
+    for (const [, s] of sessions) {
+      const times = s.pings.map(p => new Date(p.ts).getTime()).sort((a, b) => a - b)
+      blocks.push({
+        start: new Date(times[0]),
+        end: new Date(times[times.length - 1]),
+        model: s.model,
+        turns: s.pings.length,
+      })
+    }
+    blocks.sort((a, b) => a.start.getTime() - b.start.getTime())
+
+    // Total active time (sum of session durations, min 1 min per session)
+    const totalMinutes = blocks.reduce((s, b) => s + Math.max(1, (b.end.getTime() - b.start.getTime()) / 60000), 0)
+    const totalTurns = dayPings.length
+
+    return { blocks, totalMinutes, totalTurns, sessionCount: sessions.size }
+  }, [claudePings, hourlyDate])
 
   const activeRepos = activity.filter(a => a.commits.length > 0)
   const totalCommits = activity.reduce((sum, a) => sum + a.commits.length, 0)
@@ -1356,6 +1399,55 @@ export default function TrackerApp() {
                   </div>
                 )}
               </div>
+
+              {/* Activity Timeline */}
+              {activityTimeline ? (
+                <div className="t-chart-card">
+                  <div className="t-chart-header">
+                    <Clock size={14} />
+                    <span>Activity Timeline</span>
+                    <span className="t-chart-header-right">
+                      {Math.floor(activityTimeline.totalMinutes / 60) > 0 && `${Math.floor(activityTimeline.totalMinutes / 60)}h `}
+                      {Math.round(activityTimeline.totalMinutes % 60)}m · {activityTimeline.totalTurns} turns · {activityTimeline.sessionCount} sessions
+                    </span>
+                  </div>
+                  <div className="t-timeline">
+                    <div className="t-timeline-hours">
+                      {Array.from({ length: 24 }, (_, i) => (
+                        <span key={i} className="t-timeline-hour-label">{i}</span>
+                      ))}
+                    </div>
+                    <div className="t-timeline-track">
+                      {activityTimeline.blocks.map((block, i) => {
+                        const startMin = block.start.getHours() * 60 + block.start.getMinutes()
+                        const endMin = block.end.getHours() * 60 + block.end.getMinutes()
+                        const left = (startMin / 1440) * 100
+                        const width = Math.max(0.4, ((Math.max(endMin - startMin, 1)) / 1440) * 100)
+                        const shortModel = block.model.includes('opus') ? 'Opus' : block.model.includes('sonnet') ? 'Sonnet' : block.model.includes('haiku') ? 'Haiku' : block.model
+                        return (
+                          <div
+                            key={i}
+                            className="t-timeline-block"
+                            style={{ left: `${left}%`, width: `${width}%` }}
+                            title={`${block.start.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} — ${block.end.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} · ${shortModel} · ${block.turns} turns`}
+                          />
+                        )
+                      })}
+                    </div>
+                  </div>
+                </div>
+              ) : hourlyDate === new Date().toISOString().slice(0, 10) && claudePings.length === 0 ? (
+                <div className="t-chart-card">
+                  <div className="t-chart-header">
+                    <Clock size={14} />
+                    <span>Activity Timeline</span>
+                  </div>
+                  <div className="t-hourly-empty">
+                    No activity pings yet
+                    <span className="t-hourly-empty-hint">Data records automatically via Claude Code hooks on every response</span>
+                  </div>
+                </div>
+              ) : null}
 
               {/* Model Breakdown */}
               <div className="t-chart-card">
