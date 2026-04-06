@@ -1154,8 +1154,30 @@
 /* Range slider for day view zoom */
 .t-range-slider {
   position: relative;
-  height: 20px;
-  margin-top: 6px;
+  height: 28px;
+  margin-top: 8px;
+}
+
+/* Base track line */
+.t-range-slider::before {
+  content: '';
+  position: absolute;
+  top: 9px;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: var(--border-light);
+  border-radius: 2px;
+}
+
+/* Active fill between thumbs */
+.t-range-fill {
+  position: absolute;
+  top: 9px;
+  height: 3px;
+  background: #D97757;
+  border-radius: 2px;
+  pointer-events: none;
 }
 
 .t-range-input {
@@ -1173,12 +1195,12 @@
 .t-range-input::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
-  width: 14px;
-  height: 14px;
+  width: 12px;
+  height: 12px;
   border-radius: 50%;
   background: #D97757;
   border: 2px solid var(--bg-card);
-  box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+  box-shadow: 0 0 0 1px rgba(217, 119, 87, 0.3);
   cursor: grab;
   pointer-events: auto;
   position: relative;
@@ -1187,28 +1209,20 @@
 
 .t-range-input::-webkit-slider-thumb:active {
   cursor: grabbing;
-  transform: scale(1.15);
+  transform: scale(1.2);
+  box-shadow: 0 0 0 3px rgba(217, 119, 87, 0.2);
 }
 
 .t-range-input::-webkit-slider-runnable-track {
-  height: 4px;
+  height: 3px;
   background: transparent;
-}
-
-.t-range-fill {
-  position: absolute;
-  top: 8px;
-  height: 4px;
-  background: rgba(217, 119, 87, 0.35);
-  border-radius: 2px;
-  pointer-events: none;
 }
 
 .t-range-label {
   position: absolute;
-  top: 18px;
+  top: 20px;
   transform: translateX(-50%);
-  font-size: 0.62rem;
+  font-size: 0.6rem;
   color: #D97757;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
