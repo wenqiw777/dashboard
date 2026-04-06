@@ -1217,7 +1217,7 @@ export default function TrackerApp() {
       </div>
 
       {/* Stats */}
-      <div className="t-stats">
+      {viewTab !== 'claude' && <div className="t-stats">
         <div className="t-stat">
           <div className="t-stat-val">{viewTab === 'commits' ? activeRepos.length : activePRRepos.length}</div>
           <div className="t-stat-label">Active Repos</div>
@@ -1230,7 +1230,7 @@ export default function TrackerApp() {
           <div className="t-stat-val">{repos.length}</div>
           <div className="t-stat-label">Tracked</div>
         </div>
-      </div>
+      </div>}
 
       {/* Errors */}
       {error && (
