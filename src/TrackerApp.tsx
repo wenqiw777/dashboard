@@ -3,7 +3,7 @@ import {
   Plus, Trash2, Settings, RefreshCw, ExternalLink,
   Activity, GitBranch, GitPullRequest, Clock, X, AlertCircle, ArrowLeft,
   CalendarDays, CalendarRange, Calendar, ChevronLeft, ChevronRight, BarChart3,
-  Bot, MessageSquare, Wrench, Zap
+  MessageSquare, Wrench, Zap
 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import ReactEChartsCore from 'echarts-for-react/lib/core'
@@ -67,6 +67,7 @@ interface RepoPRs {
 }
 
 interface ClaudeStats {
+  lastComputedDate: string
   dailyActivity: { date: string; messageCount: number; sessionCount: number; toolCallCount: number }[]
   dailyModelTokens: { date: string; tokensByModel: Record<string, number> }[]
   modelUsage: Record<string, { inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number }>
@@ -74,6 +75,16 @@ interface ClaudeStats {
   totalMessages: number
   hourCounts: Record<string, number>
   firstSessionDate: string
+}
+
+// Claude logo icon
+function ClaudeIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" style={{ flexShrink: 0 }}>
+      <path d="M16.009 6.63c-.2-.68-.82-1.06-1.32-.84l-7.25 3.12c-.12.05-.27.16-.35.45-.08.27.01.45.1.53l5.23 4.27.03.03.12.08c.06.03.14.06.23.06.13 0 .28-.06.39-.2l3.3-5.95c.03-.07.09-.2.1-.35.02-.19-.04-.54-.27-1.15l-.01-.04Zm-8.83 2.04 7.26-3.12c1.15-.5 2.54.29 2.96 1.73l.01.04c.26.67.39 1.24.34 1.72a2.1 2.1 0 0 1-.26.86L14.15 16c-.33.6-.82.96-1.34 1a1.7 1.7 0 0 1-.99-.23 2.2 2.2 0 0 1-.37-.27l-.04-.03-5.22-4.27c-.42-.35-.72-.89-.6-1.54.1-.63.53-1.05.88-1.2l.6-.26Z" />
+      <path d="M8.98 11.56c-.2-.68-.82-1.06-1.32-.84L4.1 12.35c-.12.05-.27.16-.35.45a.6.6 0 0 0 .1.53l3.34 2.73.03.03.12.08c.06.03.14.06.23.06.13 0 .28-.06.39-.2l1.41-2.54c.03-.07.09-.2.1-.35.02-.19-.04-.54-.27-1.15l-.01-.04Zm-4.6 .55 3.57-1.63c1.15-.5 2.54.29 2.96 1.73l.01.04c.26.67.39 1.24.34 1.72a2.1 2.1 0 0 1-.26.86l-1.41 2.55c-.33.6-.82.96-1.34 1a1.7 1.7 0 0 1-.99-.23 2.2 2.2 0 0 1-.37-.27l-.04-.03-3.34-2.73c-.42-.35-.72-.89-.6-1.54.1-.63.53-1.05.88-1.2l.6-.26Z" />
+    </svg>
+  )
 }
 
 type DateRange = 'today' | 'week' | 'month' | 'custom'
@@ -520,11 +531,11 @@ export default function TrackerApp() {
     const models = [...modelSet]
 
     const modelColors: Record<string, string> = {
-      'claude-opus-4-6': resolve('var(--chart-1)'),
-      'claude-opus-4-5-20251101': resolve('var(--chart-2)'),
-      'claude-sonnet-4-6': resolve('var(--chart-4)'),
-      'claude-sonnet-4-5-20250929': resolve('var(--chart-5)'),
-      'claude-haiku-4-5-20251001': resolve('var(--chart-3)'),
+      'claude-opus-4-6': '#D97757',
+      'claude-opus-4-5-20251101': '#C65D33',
+      'claude-sonnet-4-6': '#E8A87C',
+      'claude-sonnet-4-5-20250929': '#B8856C',
+      'claude-haiku-4-5-20251001': '#F0C4A8',
     }
     const shortName = (m: string) => {
       if (m.includes('opus-4-6')) return 'Opus 4.6'
@@ -617,7 +628,7 @@ export default function TrackerApp() {
         data: data.map(v => ({
           value: v,
           itemStyle: {
-            color: resolve('var(--chart-1)'),
+            color: '#D97757',
             opacity: 0.3 + (v / maxVal) * 0.7,
             borderRadius: [2, 2, 0, 0],
           },
@@ -887,7 +898,7 @@ export default function TrackerApp() {
           className={`t-view-tab ${viewTab === 'claude' ? 'active' : ''}`}
           onClick={() => setViewTab('claude')}
         >
-          <Bot size={14} />
+          <ClaudeIcon size={14} />
           Claude Usage
         </button>
       </div>
@@ -1054,7 +1065,7 @@ export default function TrackerApp() {
         <div className="t-feed">
           {!claudeStats ? (
             <div className="t-empty">
-              <Bot size={36} strokeWidth={1.5} />
+              <ClaudeIcon size={36} />
               <p>Loading Claude stats...</p>
               <span className="t-empty-hint">Reading from ~/.claude/stats-cache.json</span>
             </div>
@@ -1063,6 +1074,7 @@ export default function TrackerApp() {
               {/* Claude Stats Cards */}
               <div className="t-claude-since">
                 All time since {new Date(claudeStats.firstSessionDate).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })}
+                <span className="t-claude-updated">Last updated: {claudeStats.lastComputedDate}</span>
               </div>
               <div className="t-stats" style={{ gridTemplateColumns: 'repeat(4, 1fr)' }}>
                 <div className="t-stat">

@@ -881,6 +881,14 @@
   color: var(--text-muted);
   margin-bottom: 8px;
   text-align: right;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.t-claude-updated {
+  font-size: 0.68rem;
+  opacity: 0.6;
 }
 
 /* GitHub-style heatmap */
@@ -971,23 +979,23 @@
 }
 
 .t-heatmap-cell[data-level="1"] {
-  background: #0e4429;
-  border-color: #0e4429;
+  background: #5C2E1A;
+  border-color: #5C2E1A;
 }
 
 .t-heatmap-cell[data-level="2"] {
-  background: #006d32;
-  border-color: #006d32;
+  background: #8B4226;
+  border-color: #8B4226;
 }
 
 .t-heatmap-cell[data-level="3"] {
-  background: #26a641;
-  border-color: #26a641;
+  background: #C65D33;
+  border-color: #C65D33;
 }
 
 .t-heatmap-cell[data-level="4"] {
-  background: #39d353;
-  border-color: #39d353;
+  background: #E8834A;
+  border-color: #E8834A;
 }
 
 .t-heatmap-legend {
@@ -1017,7 +1025,7 @@
 
 /* Claude cost highlight */
 .t-claude-cost {
-  color: var(--accent);
+  color: #D97757;
   font-weight: 600;
 }
 
