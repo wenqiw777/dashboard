@@ -174,7 +174,7 @@ async function scanSessions() {
 
   const result = {
     version: 1,
-    lastComputedDate: new Date().toISOString().slice(0, 10),
+    lastComputedDate: (() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; })(),
     dailyActivity: dailyActivityArr,
     dailyModelTokens: dailyModelTokensArr,
     modelUsage,

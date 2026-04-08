@@ -92,7 +92,7 @@ function ClaudeIcon({ size = 14 }: { size?: number }) {
   )
 }
 
-type DateRange = 'today' | 'week' | 'month' | 'custom'
+type DateRange = 'today' | 'week' | 'month' | 'quarter' | 'custom'
 type ViewTab = 'commits' | 'prs' | 'claude'
 
 // Claude model pricing ($ per million tokens)
@@ -145,6 +145,10 @@ function getDateRange(range: DateRange, customDate?: Date) {
     case 'month':
       since = new Date(now)
       since.setMonth(since.getMonth() - 1)
+      break
+    case 'quarter':
+      since = new Date(now)
+      since.setMonth(since.getMonth() - 3)
       break
     case 'custom':
       if (customDate) {
@@ -325,22 +329,9 @@ export default function TrackerApp() {
     return () => clearInterval(interval)
   }, [loadClaudeStats])
 
-  // Load month-level data for chart/calendar (always fetches last 30 days)
   const loadMonthActivity = useCallback(async () => {
-    if (repos.length === 0) { setMonthActivity([]); return }
-    try {
-      const now = new Date()
-      const since = new Date(now)
-      since.setDate(since.getDate() - 30)
-      const params = new URLSearchParams({ since: since.toISOString(), until: now.toISOString() })
-      if (config.githubUsername) params.set('author', config.githubUsername)
-      const res = await fetch(`/api/activity?${params}`)
-      if (res.ok) {
-        const data = await res.json()
-        setMonthActivity(data.activity || [])
-      }
-    } catch { /* silent */ }
-  }, [repos.length, config.githubUsername])
+    // no-op: chart now uses activity state directly
+  }, [])
 
   const loadActivity = useCallback(async () => {
     if (repos.length === 0) { setActivity([]); setPrData([]); return }
@@ -479,17 +470,22 @@ export default function TrackerApp() {
 
   // Commits by date per repo (for stacked chart)
   const chartData = useMemo(() => {
+    // For 'today', show last 7 days in the chart
+    const chartDateRange: DateRange = dateRange === 'today' ? 'week' : dateRange
     const days: string[] = []
-    const now = new Date()
-    for (let i = 29; i >= 0; i--) {
-      const d = new Date(now)
-      d.setDate(d.getDate() - i)
-      days.push(toDateKey(d))
+    const { since, until } = getDateRange(chartDateRange, customDate || undefined)
+    const cur = new Date(since)
+    cur.setHours(0, 0, 0, 0)
+    const end = new Date(until)
+    end.setHours(23, 59, 59, 999)
+    while (cur <= end) {
+      days.push(toDateKey(cur))
+      cur.setDate(cur.getDate() + 1)
     }
 
-    // group by repo
+    // group by repo — use activity state directly
     const repoMap = new Map<string, Map<string, number>>()
-    for (const ra of monthActivity) {
+    for (const ra of activity) {
       const repoName = ra.repo.split('/')[1] || ra.repo
       if (!repoMap.has(repoName)) repoMap.set(repoName, new Map())
       const m = repoMap.get(repoName)!
@@ -499,14 +495,18 @@ export default function TrackerApp() {
       }
     }
 
-    const repoNames = [...repoMap.keys()]
+    // Only show repos that have at least one commit in the 30-day window
+    const repoNames = [...repoMap.keys()].filter(name => {
+      const m = repoMap.get(name)!
+      return days.some(d => (m.get(d) || 0) > 0)
+    })
     const chartColors = [
       'var(--chart-1)', 'var(--chart-2)', 'var(--chart-3)',
       'var(--chart-4)', 'var(--chart-5)', 'var(--chart-6)',
     ]
 
     return { days, repoNames, repoMap, chartColors }
-  }, [monthActivity])
+  }, [activity, dateRange, customDate])
 
   const handleAddRepo = async () => {
     const url = repoUrl.trim()
@@ -1164,6 +1164,13 @@ export default function TrackerApp() {
             <CalendarRange size={14} />
             <span>This Month</span>
           </button>
+          <button
+            className={`t-date-tab ${dateRange === 'quarter' ? 'active' : ''}`}
+            onClick={() => { setDateRange('quarter'); setCustomDate(null) }}
+          >
+            <CalendarRange size={14} />
+            <span>3 Months</span>
+          </button>
           <div className="t-cal-wrapper" ref={calendarRef}>
             <button
               className={`t-date-tab ${dateRange === 'custom' ? 'active' : ''}`}
@@ -1196,11 +1203,11 @@ export default function TrackerApp() {
       </div>
 
       {/* Workload Chart */}
-      {showChart && repos.length > 0 && (
+      {showChart && repos.length > 0 && dateRange !== 'custom' && (
         <div className="t-chart-card">
           <div className="t-chart-header">
             <BarChart3 size={14} />
-            <span>Workload — Last 30 Days</span>
+            <span>Workload — {dateRange === 'today' ? 'Last 7 Days' : dateRange === 'week' ? 'Last 7 Days' : dateRange === 'month' ? 'Last 30 Days' : dateRange === 'quarter' ? 'Last 3 Months' : 'Custom'}</span>
           </div>
           <ReactEChartsCore
             echarts={echarts}
@@ -1286,7 +1293,7 @@ export default function TrackerApp() {
           ) : activeRepos.length === 0 && !loading ? (
             <div className="t-empty">
               <Clock size={36} strokeWidth={1.5} />
-              <p>No commits {dateRange === 'today' ? 'today' : dateRange === 'custom' ? 'on this date' : dateRange === 'week' ? 'this week' : 'this month'}</p>
+              <p>No commits {dateRange === 'today' ? 'today' : dateRange === 'custom' ? 'on this date' : dateRange === 'week' ? 'this week' : dateRange === 'quarter' ? 'in the last 3 months' : 'this month'}</p>
               <span className="t-empty-hint">Try a different time range</span>
             </div>
           ) : (
@@ -1348,7 +1355,7 @@ export default function TrackerApp() {
           ) : activePRRepos.length === 0 && !loading ? (
             <div className="t-empty">
               <GitPullRequest size={36} strokeWidth={1.5} />
-              <p>No PRs {dateRange === 'today' ? 'today' : dateRange === 'custom' ? 'on this date' : dateRange === 'week' ? 'this week' : 'this month'}</p>
+              <p>No PRs {dateRange === 'today' ? 'today' : dateRange === 'custom' ? 'on this date' : dateRange === 'week' ? 'this week' : dateRange === 'quarter' ? 'in the last 3 months' : 'this month'}</p>
               <span className="t-empty-hint">Try a different time range</span>
             </div>
           ) : (
