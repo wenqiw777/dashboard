@@ -6,6 +6,7 @@ import path from 'path';
 import os from 'os';
 import { createReadStream } from 'fs';
 import { createInterface } from 'readline';
+import { execSync } from 'child_process';
 
 const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 const OUTPUT_FILE = path.join(path.dirname(import.meta.dirname), 'data', 'claude-stats.json');
@@ -26,18 +27,10 @@ async function collectJsonlFiles(dir) {
 }
 
 async function scanSessions() {
-  const MODEL_PRICING = {
-    'claude-opus-4-6':            { input: 15,   output: 75,  cacheRead: 1.875, cacheWrite: 18.75 },
-    'claude-opus-4-5-20251101':   { input: 15,   output: 75,  cacheRead: 1.875, cacheWrite: 18.75 },
-    'claude-sonnet-4-6':          { input: 3,    output: 15,  cacheRead: 0.375, cacheWrite: 3.75  },
-    'claude-sonnet-4-5-20250929': { input: 3,    output: 15,  cacheRead: 0.375, cacheWrite: 3.75  },
-    'claude-haiku-4-5-20251001':  { input: 0.80, output: 4,   cacheRead: 0.08,  cacheWrite: 1.0   },
-  };
+  // Token + cost data comes from ccusage (live LiteLLM pricing).
+  // This script still owns: dailyActivity, hourCounts, sessions, longestSession.
 
   const dailyActivity = {};   // date -> { messages, sessions Set, toolCalls }
-  const dailyTokens = {};     // date -> { model -> tokens }
-  const dailyCost = {};       // date -> { model -> costUSD }
-  const modelUsage = {};      // model -> { inputTokens, outputTokens, cacheReadInputTokens, cacheCreationInputTokens }
   const hourCounts = {};      // hour -> count (local time)
   const sessions = new Set();
   let firstDate = null;
@@ -94,41 +87,8 @@ async function scanSessions() {
             dailyActivity[date].messages++;
             hourCounts[hour] = (hourCounts[hour] || 0) + 1;
 
-            const msg = record.message || {};
-            const model = msg.model;
-            const usage = msg.usage;
-
-            if (model && usage) {
-              // Daily tokens by model
-              if (!dailyTokens[date]) dailyTokens[date] = {};
-              const totalTokens = (usage.input_tokens || 0) + (usage.output_tokens || 0)
-                + (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0);
-              dailyTokens[date][model] = (dailyTokens[date][model] || 0) + totalTokens;
-
-              // Daily cost by model
-              if (!dailyCost[date]) dailyCost[date] = {};
-              const p = MODEL_PRICING[model];
-              if (p) {
-                const cost = (
-                  (usage.input_tokens || 0) * p.input +
-                  (usage.output_tokens || 0) * p.output +
-                  (usage.cache_read_input_tokens || 0) * p.cacheRead +
-                  (usage.cache_creation_input_tokens || 0) * p.cacheWrite
-                ) / 1_000_000;
-                dailyCost[date][model] = (dailyCost[date][model] || 0) + cost;
-              }
-
-              // Cumulative model usage
-              if (!modelUsage[model]) {
-                modelUsage[model] = { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 };
-              }
-              modelUsage[model].inputTokens            += usage.input_tokens || 0;
-              modelUsage[model].outputTokens           += usage.output_tokens || 0;
-              modelUsage[model].cacheReadInputTokens   += usage.cache_read_input_tokens || 0;
-              modelUsage[model].cacheCreationInputTokens += usage.cache_creation_input_tokens || 0;
-            }
-
             // Count tool calls
+            const msg = record.message || {};
             if (msg.content && Array.isArray(msg.content)) {
               for (const block of msg.content) {
                 if (block.type === 'tool_use') {
@@ -144,36 +104,12 @@ async function scanSessions() {
     }
   }
 
-  for (const [model, u] of Object.entries(modelUsage)) {
-    const p = MODEL_PRICING[model];
-    if (p) {
-      u.costUSD = (
-        u.inputTokens * p.input +
-        u.outputTokens * p.output +
-        u.cacheReadInputTokens * p.cacheRead +
-        u.cacheCreationInputTokens * p.cacheWrite
-      ) / 1_000_000;
-    } else {
-      u.costUSD = 0;
-    }
-  }
-
   const sortedDates = Object.keys(dailyActivity).sort();
   const dailyActivityArr = sortedDates.map(date => ({
     date,
     messageCount: dailyActivity[date].messages,
     sessionCount: dailyActivity[date].sessions.size,
     toolCallCount: dailyActivity[date].toolCalls,
-  }));
-
-  const dailyModelTokensArr = Object.keys(dailyTokens).sort().map(date => ({
-    date,
-    tokensByModel: dailyTokens[date],
-  }));
-
-  const dailyCostArr = Object.keys(dailyCost).sort().map(date => ({
-    date,
-    costByModel: dailyCost[date],
   }));
 
   let longestSession = null;
@@ -184,18 +120,60 @@ async function scanSessions() {
     }
   }
 
-  const totalCost = Object.values(modelUsage).reduce((s, u) => s + (u.costUSD || 0), 0);
-
   // Use earliest date from any activity (not just user messages)
   const earliestDate = sortedDates.length > 0 ? sortedDates[0] : firstDate;
   const firstSessionDate = earliestDate ? new Date(earliestDate).toISOString() : null;
 
-  // Add v3 fields to modelUsage
-  for (const [, u] of Object.entries(modelUsage)) {
-    u.webSearchRequests = u.webSearchRequests || 0;
-    u.contextWindow = u.contextWindow || 0;
-    u.maxOutputTokens = u.maxOutputTokens || 0;
+  // Pull token + cost data from ccusage (live LiteLLM pricing — no manual price table)
+  let ccusageJson;
+  try {
+    const out = execSync('ccusage daily --json', { encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024 });
+    ccusageJson = JSON.parse(out);
+  } catch (e) {
+    console.error('ccusage failed — install via `brew install ccusage` or `npm i -g ccusage`');
+    throw e;
   }
+
+  const dailyModelTokensArr = ccusageJson.daily.map(d => ({
+    date: d.date,
+    tokensByModel: Object.fromEntries(
+      d.modelBreakdowns.map(m => [
+        m.modelName,
+        m.inputTokens + m.outputTokens + m.cacheReadTokens + m.cacheCreationTokens,
+      ]),
+    ),
+  }));
+
+  const dailyCostArr = ccusageJson.daily.map(d => ({
+    date: d.date,
+    costByModel: Object.fromEntries(d.modelBreakdowns.map(m => [m.modelName, m.cost])),
+  }));
+
+  const modelUsage = {};
+  for (const day of ccusageJson.daily) {
+    for (const m of day.modelBreakdowns) {
+      if (!modelUsage[m.modelName]) {
+        modelUsage[m.modelName] = {
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          costUSD: 0,
+          webSearchRequests: 0,
+          contextWindow: 0,
+          maxOutputTokens: 0,
+        };
+      }
+      const u = modelUsage[m.modelName];
+      u.inputTokens += m.inputTokens;
+      u.outputTokens += m.outputTokens;
+      u.cacheReadInputTokens += m.cacheReadTokens;
+      u.cacheCreationInputTokens += m.cacheCreationTokens;
+      u.costUSD += m.cost;
+    }
+  }
+
+  const totalCost = ccusageJson.totals.totalCost;
 
   const result = {
     version: 3,
@@ -217,8 +195,8 @@ async function scanSessions() {
   await fs.writeFile(OUTPUT_FILE, JSON.stringify(result), 'utf-8');
 
   console.log(`Stats rebuilt: ${sessions.size} sessions, ${result.totalMessages} messages, ${sortedDates.length} days`);
-  console.log(`Models: ${Object.keys(modelUsage).join(', ')}`);
-  console.log(`Estimated total cost: $${totalCost.toFixed(2)}`);
+  console.log(`Models (from ccusage): ${Object.keys(modelUsage).join(', ')}`);
+  console.log(`Total cost (from ccusage): $${totalCost.toFixed(2)}`);
   console.log(`Saved to ${OUTPUT_FILE}`);
 }
 
