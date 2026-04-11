@@ -674,6 +674,7 @@ async function rebuildStats() {
         // Project-level aggregation
         let projTotalCost = 0;
         const projModels = {};   // modelName -> { outputTokens, costUSD }
+        const projDailyMap = {}; // date -> { date, totalCostUSD, models: { name -> { outputTokens, costUSD } } }
         const projDates = new Set();
         let projFirstDate = null;
         let projLastDate = null;
@@ -684,12 +685,23 @@ async function rebuildStats() {
           if (!projFirstDate || date < projFirstDate) projFirstDate = date;
           if (!projLastDate || date > projLastDate) projLastDate = date;
 
+          if (!projDailyMap[date]) {
+            projDailyMap[date] = { date, totalCostUSD: 0, models: {} };
+          }
+          const dayBucket = projDailyMap[date];
+
           for (const m of entry.modelBreakdowns) {
             // Per-project per-model
             if (!projModels[m.modelName]) projModels[m.modelName] = { outputTokens: 0, costUSD: 0 };
             projModels[m.modelName].outputTokens += m.outputTokens;
             projModels[m.modelName].costUSD += m.cost;
             projTotalCost += m.cost;
+
+            // Per-project per-day per-model
+            if (!dayBucket.models[m.modelName]) dayBucket.models[m.modelName] = { outputTokens: 0, costUSD: 0 };
+            dayBucket.models[m.modelName].outputTokens += m.outputTokens;
+            dayBucket.models[m.modelName].costUSD += m.cost;
+            dayBucket.totalCostUSD += m.cost;
 
             // Global per-day per-model rollup (replaces what `daily --json` used to give us)
             if (!tokensByDate[date]) tokensByDate[date] = {};
@@ -717,10 +729,14 @@ async function rebuildStats() {
 
         totalCost += projTotalCost;
 
-        // Filter: only surface projects with ≥ $5 total spend
-        if (projTotalCost >= 5) {
+        // Filter: only surface projects with ≥ $10 total spend
+        if (projTotalCost >= 10) {
           const cwd = projectCwd[encodedDir];
           const displayName = cwd ? path.basename(cwd) : encodedDir;
+          // Last 10 active days, newest first
+          const dailyBreakdown = Object.values(projDailyMap)
+            .sort((a, b) => b.date.localeCompare(a.date))
+            .slice(0, 10);
           projectUsage[encodedDir] = {
             displayName,
             cwd: cwd || null,
@@ -729,6 +745,7 @@ async function rebuildStats() {
             firstActivity: projFirstDate,
             lastActivity: projLastDate,
             models: projModels,
+            dailyBreakdown,
           };
         }
       }
@@ -742,7 +759,7 @@ async function rebuildStats() {
     const earliestDate = sortedDates.length > 0 ? sortedDates[0] : firstDate;
 
     const result = {
-      version: 4, lastComputedDate: todayStr(),
+      version: 5, lastComputedDate: todayStr(),
       dailyActivity: dailyActivityArr, dailyModelTokens: dailyModelTokensArr, dailyCost: dailyCostArr,
       modelUsage, projectUsage, totalSessions: sessions.size,
       totalMessages: dailyActivityArr.reduce((s, d) => s + d.messageCount, 0),
@@ -763,7 +780,7 @@ async function rebuildStats() {
 // Rebuild on server start
 rebuildStats();
 
-const STATS_SCHEMA_VERSION = 4;
+const STATS_SCHEMA_VERSION = 5;
 
 app.get('/api/claude-stats', async (_req, res) => {
   try {

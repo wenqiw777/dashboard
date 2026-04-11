@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import {
   Plus, Trash2, Settings, RefreshCw, ExternalLink,
   Activity, GitBranch, GitPullRequest, Clock, X, AlertCircle, ArrowLeft,
-  CalendarDays, CalendarRange, Calendar, ChevronLeft, ChevronRight, BarChart3,
+  CalendarDays, CalendarRange, Calendar, ChevronLeft, ChevronRight, ChevronDown, BarChart3,
   MessageSquare, Wrench, Zap, HardDrive
 } from 'lucide-react'
 import { Link } from 'react-router-dom'
@@ -80,6 +80,7 @@ interface ClaudeStats {
     firstActivity: string
     lastActivity: string
     models: Record<string, { outputTokens: number; costUSD: number }>
+    dailyBreakdown?: { date: string; totalCostUSD: number; models: Record<string, { outputTokens: number; costUSD: number }> }[]
   }>
   totalSessions: number
   totalMessages: number
@@ -289,19 +290,22 @@ export default function TrackerApp() {
   const [monthActivity, setMonthActivity] = useState<RepoActivity[]>([])
   const [claudeStats, setClaudeStats] = useState<ClaudeStats | null>(null)
   const [claudePings, setClaudePings] = useState<ClaudePing[]>([])
+  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set())
   const [activityDate, setActivityDate] = useState(() => new Date().toISOString().slice(0, 10))
   const [activityView, setActivityView] = useState<'day' | 'week' | 'month' | 'projects'>('day')
   const [showActivityCal, setShowActivityCal] = useState(false)
   const [blockTooltip, setBlockTooltip] = useState<{ text: string; x: number; y: number; trackId: string } | null>(null)
   const [dayRange, setDayRange] = useState<[number, number]>([0, 24]) // hours
-  const [isDraggingTimeline, setIsDraggingTimeline] = useState(false)
-  const [dragStartX, setDragStartX] = useState(0)
-  const [dragStartRange, setDragStartRange] = useState<[number, number]>([0, 24])
+  const [isDragSelecting, setIsDragSelecting] = useState(false)
   const [heatmapTooltip, setHeatmapTooltip] = useState<{ text: string; x: number; y: number } | null>(null)
   const heatmapRef = useRef<HTMLDivElement>(null)
   const calendarRef = useRef<HTMLDivElement>(null)
   const activityCalRef = useRef<HTMLDivElement>(null)
   const timelineZoomRef = useRef<HTMLDivElement>(null)
+  const selectStartPxRef = useRef(0)
+  const selectOverlayRef = useRef<HTMLDivElement>(null)
+  const tooltipTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const lastFittedDateRef = useRef<string | null>(null)
 
   const loadClaudeStats = useCallback(async () => {
     try {
@@ -416,6 +420,7 @@ export default function TrackerApp() {
   const wheelHandlerRef = useRef<((e: WheelEvent) => void) | null>(null)
   if (!wheelHandlerRef.current) {
     wheelHandlerRef.current = (e: WheelEvent) => {
+      if (!e.altKey) return // only zoom on Alt+scroll; normal scroll passes through
       e.preventDefault()
       e.stopPropagation()
       const el = timelineZoomRef.current
@@ -913,6 +918,20 @@ export default function TrackerApp() {
 
     return { blocks, totalMinutes, totalTurns: dayPings.length, sessionCount }
   }, [claudePings, activityDate, buildBlocks, filterPingsByDate])
+
+  // Auto-fit dayRange when switching to a new date (not on every background refresh)
+  useEffect(() => {
+    if (!activityTimeline?.blocks.length) return
+    if (lastFittedDateRef.current === activityDate) return // already fitted for this date
+    lastFittedDateRef.current = activityDate
+    const allMins = activityTimeline.blocks.flatMap(b => [
+      b.start.getHours() * 60 + b.start.getMinutes(),
+      b.end.getHours() * 60 + b.end.getMinutes(),
+    ])
+    const minHour = Math.max(0, Math.floor(Math.min(...allMins) / 60) - 0.5)
+    const maxHour = Math.min(24, Math.ceil(Math.max(...allMins) / 60) + 0.5)
+    setDayRange([minHour, maxHour])
+  }, [activityDate, activityTimeline])
 
   // Week view: 7 days of activity tracks
   const activityWeek = useMemo(() => {
@@ -1720,28 +1739,45 @@ export default function TrackerApp() {
                       rulerTicks.push({ h, major: Math.abs(h % labelStep) < 0.01 || Math.abs(h % labelStep - labelStep) < 0.01 })
                     }
 
+                    const fitToData = () => {
+                      const allMins = activityTimeline.blocks.flatMap(b => [
+                        b.start.getHours() * 60 + b.start.getMinutes(),
+                        b.end.getHours() * 60 + b.end.getMinutes(),
+                      ])
+                      const minH = Math.max(0, Math.floor(Math.min(...allMins) / 60) - 0.5)
+                      const maxH = Math.min(24, Math.ceil(Math.max(...allMins) / 60) + 0.5)
+                      setDayRange([minH, maxH])
+                    }
+
                     const handleMouseDown = (e: React.MouseEvent) => {
-                      const r = dayRangeRef.current
-                      if (r[0] === 0 && r[1] === 24) return
                       e.preventDefault()
-                      setIsDraggingTimeline(true)
-                      const startX = e.clientX
-                      const startRange: [number, number] = [r[0], r[1]]
-                      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
-                      const hoursPerPx = (startRange[1] - startRange[0]) / rect.width
+                      if (tooltipTimerRef.current) { clearTimeout(tooltipTimerRef.current); tooltipTimerRef.current = null }
+                      setBlockTooltip(null)
+                      setIsDragSelecting(true)
+                      const trackRect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+                      selectStartPxRef.current = e.clientX - trackRect.left
+                      if (selectOverlayRef.current) { selectOverlayRef.current.style.left = `${selectStartPxRef.current}px`; selectOverlayRef.current.style.width = '0px' }
                       const handleMouseMove = (ev: MouseEvent) => {
-                        const dx = ev.clientX - startX
-                        const shift = -dx * hoursPerPx
-                        let s = startRange[0] + shift
-                        let en = startRange[1] + shift
-                        if (s < 0) { en -= s; s = 0 }
-                        if (en > 24) { s -= (en - 24); en = 24 }
-                        setDayRange([Math.max(0, s), Math.min(24, en)])
+                        if (selectOverlayRef.current) {
+                          const startX = selectStartPxRef.current
+                          const endX = ev.clientX - trackRect.left
+                          selectOverlayRef.current.style.left = `${Math.min(startX, endX)}px`
+                          selectOverlayRef.current.style.width = `${Math.abs(endX - startX)}px`
+                        }
                       }
-                      const handleMouseUp = () => {
-                        setIsDraggingTimeline(false)
+                      const handleMouseUp = (ev: MouseEvent) => {
+                        setIsDragSelecting(false)
                         document.removeEventListener('mousemove', handleMouseMove)
                         document.removeEventListener('mouseup', handleMouseUp)
+                        const endX = ev.clientX - trackRect.left
+                        const startX = selectStartPxRef.current
+                        if (selectOverlayRef.current) selectOverlayRef.current.style.width = '0'
+                        if (Math.abs(endX - startX) < 4) return // too small, treat as click
+                        const r = dayRangeRef.current
+                        const span = r[1] - r[0]
+                        const startFrac = Math.max(0, Math.min(1, Math.min(startX, endX) / trackRect.width))
+                        const endFrac = Math.max(0, Math.min(1, Math.max(startX, endX) / trackRect.width))
+                        setDayRange([r[0] + startFrac * span, r[0] + endFrac * span])
                       }
                       document.addEventListener('mousemove', handleMouseMove)
                       document.addEventListener('mouseup', handleMouseUp)
@@ -1750,15 +1786,30 @@ export default function TrackerApp() {
                     return (
                       <>
                         <div className="t-activity-summary">
-                          {Math.floor(activityTimeline.totalMinutes / 60) > 0 && `${Math.floor(activityTimeline.totalMinutes / 60)}h `}
-                          {Math.round(activityTimeline.totalMinutes % 60)}m · {activityTimeline.totalTurns} turns · {activityTimeline.sessionCount} sessions
-                          {(dayRange[0] !== 0 || dayRange[1] !== 24) && (
-                            <button className="t-range-reset" onClick={() => setDayRange([0, 24])}>Reset</button>
-                          )}
+                          <span>
+                            {Math.floor(activityTimeline.totalMinutes / 60) > 0 && `${Math.floor(activityTimeline.totalMinutes / 60)}h `}
+                            {Math.round(activityTimeline.totalMinutes % 60)}m · {activityTimeline.totalTurns} turns · {activityTimeline.sessionCount} sessions
+                          </span>
+                          <div className="t-zoom-controls">
+                            <button className="t-zoom-btn" title="Zoom out" onClick={() => {
+                              const r = dayRangeRef.current
+                              const center = (r[0] + r[1]) / 2
+                              const newSpan = Math.min(24, (r[1] - r[0]) * 1.5)
+                              setDayRange([Math.max(0, center - newSpan / 2), Math.min(24, center + newSpan / 2)])
+                            }}>−</button>
+                            <button className="t-zoom-btn" title="Zoom in" onClick={() => {
+                              const r = dayRangeRef.current
+                              const center = (r[0] + r[1]) / 2
+                              const newSpan = Math.max(0.25, (r[1] - r[0]) * 0.67)
+                              setDayRange([Math.max(0, center - newSpan / 2), Math.min(24, center + newSpan / 2)])
+                            }}>+</button>
+                            <button className="t-zoom-btn" title="Fit to activity" onClick={fitToData}>Fit</button>
+                            <button className="t-zoom-btn" title="Full day" onClick={() => setDayRange([0, 24])}>24h</button>
+                          </div>
                         </div>
                         <div
                           ref={timelineRefCallback}
-                          className={`t-timeline t-timeline-zoomable${isDraggingTimeline ? ' dragging' : dayRange[0] !== 0 || dayRange[1] !== 24 ? ' zoomed' : ''}`}
+                          className={`t-timeline t-timeline-zoomable${isDragSelecting ? ' selecting' : ''}`}
                           onMouseDown={handleMouseDown}
                         >
                           {/* Ruler */}
@@ -1789,14 +1840,23 @@ export default function TrackerApp() {
                                   className="t-timeline-block"
                                   style={{ left: `${Math.max(0, left)}%`, width: `${width}%`, background: color }}
                                   onMouseEnter={e => {
-                                    const rect = (e.target as HTMLElement).getBoundingClientRect()
+                                    if (isDragSelecting) return
+                                    if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current)
+                                    const bRect = (e.target as HTMLElement).getBoundingClientRect()
                                     const track = (e.target as HTMLElement).parentElement!.getBoundingClientRect()
-                                    setBlockTooltip({ text: tip, x: rect.left - track.left + rect.width / 2, y: -8, trackId: 'day' })
+                                    const x = bRect.left - track.left + bRect.width / 2
+                                    tooltipTimerRef.current = setTimeout(() => {
+                                      setBlockTooltip({ text: tip, x, y: -8, trackId: 'day' })
+                                    }, 150)
                                   }}
-                                  onMouseLeave={() => setBlockTooltip(null)}
+                                  onMouseLeave={() => {
+                                    if (tooltipTimerRef.current) { clearTimeout(tooltipTimerRef.current); tooltipTimerRef.current = null }
+                                    setBlockTooltip(null)
+                                  }}
                                 />
                               )
                             })}
+                            <div ref={selectOverlayRef} className="t-select-overlay" style={{ width: 0 }} />
                             {blockTooltip?.trackId === 'day' && <div className="t-block-tooltip" style={{ left: blockTooltip.x, top: blockTooltip.y }}>{blockTooltip.text}</div>}
                           </div>
                         </div>
@@ -1925,46 +1985,117 @@ export default function TrackerApp() {
                     </span>
                   </div>
                   <div style={{ padding: '12px 16px' }}>
-                    {Object.entries(claudeStats.projectUsage)
-                      .sort((a, b) => b[1].totalCostUSD - a[1].totalCostUSD)
-                      .map(([key, proj]) => {
-                        const stale = formatRelativeTime(proj.lastActivity).match(/mo ago|y ago/) !== null
-                        const sortedModels = Object.entries(proj.models).sort((a, b) => b[1].costUSD - a[1].costUSD)
-                        return (
-                          <div key={key} className={`t-claude-project-section${stale ? ' t-claude-project-stale' : ''}`}>
-                            <div className="t-claude-project-header">
-                              <div className="t-claude-project-name-meta">
-                                <span className="t-claude-project-name" title={proj.cwd || key}>{proj.displayName}</span>
-                                <span className="t-claude-project-meta">
-                                  · {proj.daysActive} {proj.daysActive === 1 ? 'day' : 'days'} · {formatRelativeTime(proj.lastActivity)}
-                                </span>
+                    {(() => {
+                      const shortModelName = (mname: string) =>
+                        mname.includes('opus-4-6') ? 'Opus 4.6' :
+                        mname.includes('opus-4-5') ? 'Opus 4.5' :
+                        mname.includes('sonnet-4-6') ? 'Sonnet 4.6' :
+                        mname.includes('sonnet-4-5') ? 'Sonnet 4.5' :
+                        mname.includes('haiku') ? 'Haiku 4.5' : mname
+                      const formatTokens = (out: number) =>
+                        out >= 1_000_000 ? `${(out / 1_000_000).toFixed(1)}M` :
+                        out >= 1000 ? `${(out / 1000).toFixed(0)}k` : String(out)
+                      const getModelColor = (mname: string) =>
+                        mname.includes('opus-4-6') ? '#D97757' :
+                        mname.includes('opus-4-5') ? '#C65D33' :
+                        mname.includes('sonnet-4-6') ? '#E8A87C' :
+                        mname.includes('sonnet-4-5') ? '#B8856C' :
+                        mname.includes('haiku') ? '#F0C4A8' : '#999'
+                      return Object.entries(claudeStats.projectUsage)
+                        .sort((a, b) => b[1].totalCostUSD - a[1].totalCostUSD)
+                        .map(([key, proj]) => {
+                          const stale = formatRelativeTime(proj.lastActivity).match(/mo ago|y ago/) !== null
+                          const sortedModels = Object.entries(proj.models).sort((a, b) => b[1].costUSD - a[1].costUSD)
+                          const isExpanded = expandedProjects.has(key)
+                          const toggle = () => {
+                            setExpandedProjects(prev => {
+                              const next = new Set(prev)
+                              if (next.has(key)) next.delete(key); else next.add(key)
+                              return next
+                            })
+                          }
+                          return (
+                            <div key={key} className={`t-claude-project-section${stale ? ' t-claude-project-stale' : ''}`}>
+                              <div className="t-claude-project-header t-claude-project-header-toggle" onClick={toggle} role="button" tabIndex={0}
+                                onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle() } }}>
+                                <div className="t-claude-project-name-meta">
+                                  <ChevronDown size={12} className={`t-claude-project-chevron${isExpanded ? ' expanded' : ''}`} />
+                                  <span className="t-claude-project-name" title={proj.cwd || key}>{proj.displayName}</span>
+                                  <span className="t-claude-project-meta">
+                                    · {proj.daysActive} {proj.daysActive === 1 ? 'day' : 'days'} · {formatRelativeTime(proj.lastActivity)}
+                                  </span>
+                                </div>
+                                <span className="t-claude-cost">{formatUSD(proj.totalCostUSD)}</span>
                               </div>
-                              <span className="t-claude-cost">{formatUSD(proj.totalCostUSD)}</span>
-                            </div>
-                            <div className="t-claude-project-models">
-                              {sortedModels.map(([mname, m]) => {
-                                const shortName = mname.includes('opus-4-6') ? 'Opus 4.6' :
-                                  mname.includes('opus-4-5') ? 'Opus 4.5' :
-                                  mname.includes('sonnet-4-6') ? 'Sonnet 4.6' :
-                                  mname.includes('sonnet-4-5') ? 'Sonnet 4.5' :
-                                  mname.includes('haiku') ? 'Haiku 4.5' : mname
-                                const out = m.outputTokens
-                                const outStr = out >= 1_000_000 ? `${(out / 1_000_000).toFixed(1)}M` : out >= 1000 ? `${(out / 1000).toFixed(0)}k` : String(out)
-                                return (
+                              <div className="t-claude-project-models">
+                                {sortedModels.map(([mname, m]) => (
                                   <div key={mname} className="t-claude-project-model-row">
-                                    <span className="t-claude-project-model-name">{shortName}</span>
+                                    <span className="t-claude-project-model-name">{shortModelName(mname)}</span>
                                     <div className="t-claude-project-model-stats">
-                                      <span title="Output tokens">{outStr} out</span>
+                                      <span title="Output tokens">{formatTokens(m.outputTokens)} out</span>
                                       <span className="t-claude-sep">·</span>
                                       <span className="t-claude-cost">{formatUSD(m.costUSD)}</span>
                                     </div>
                                   </div>
+                                ))}
+                              </div>
+                              {isExpanded && proj.dailyBreakdown && proj.dailyBreakdown.length > 0 && (() => {
+                                const maxDayCost = Math.max(...proj.dailyBreakdown.map(d => d.totalCostUSD), 0.01)
+                                return (
+                                  <div className="t-claude-project-days">
+                                    <div className="t-claude-project-days-title">
+                                      <span>Last {proj.dailyBreakdown.length} active {proj.dailyBreakdown.length === 1 ? 'day' : 'days'}</span>
+                                    </div>
+                                    {proj.dailyBreakdown.map(day => {
+                                      const dayModels = Object.entries(day.models).sort((a, b) => b[1].costUSD - a[1].costUSD)
+                                      const d = new Date(day.date + 'T00:00:00')
+                                      const weekday = d.toLocaleDateString([], { weekday: 'short' })
+                                      const monthDay = d.toLocaleDateString([], { month: 'short', day: 'numeric' })
+                                      const pct = (day.totalCostUSD / maxDayCost) * 100
+                                      // Build gradient from dominant-model colors so the bar hints at the mix
+                                      const stops: string[] = []
+                                      let acc = 0
+                                      for (const [mname, m] of dayModels) {
+                                        const frac = day.totalCostUSD > 0 ? (m.costUSD / day.totalCostUSD) * 100 : 0
+                                        const color = getModelColor(mname)
+                                        stops.push(`${color} ${acc}%`, `${color} ${acc + frac}%`)
+                                        acc += frac
+                                      }
+                                      const barBg = stops.length > 0 ? `linear-gradient(90deg, ${stops.join(', ')})` : 'var(--border-light)'
+                                      return (
+                                        <div key={day.date} className="t-claude-project-day">
+                                          <div className="t-claude-project-day-header">
+                                            <span className="t-claude-project-day-date">
+                                              <span className="t-claude-project-day-weekday">{weekday}</span>
+                                              <span className="t-claude-project-day-monthday">{monthDay}</span>
+                                            </span>
+                                            <span className="t-claude-project-day-cost">{formatUSD(day.totalCostUSD)}</span>
+                                          </div>
+                                          <div className="t-claude-project-day-bar">
+                                            <div className="t-claude-project-day-bar-fill" style={{ width: `${pct}%`, background: barBg }} />
+                                          </div>
+                                          <div className="t-claude-project-day-models">
+                                            {dayModels.map(([mname, m]) => (
+                                              <div key={mname} className="t-claude-project-day-model">
+                                                <span className="t-claude-project-day-model-name">
+                                                  <span className="t-model-dot" style={{ background: getModelColor(mname) }} />
+                                                  {shortModelName(mname)}
+                                                </span>
+                                                <span className="t-claude-project-day-model-tokens" title="Output tokens">{formatTokens(m.outputTokens)}</span>
+                                                <span className="t-claude-project-day-model-cost">{formatUSD(m.costUSD)}</span>
+                                              </div>
+                                            ))}
+                                          </div>
+                                        </div>
+                                      )
+                                    })}
+                                  </div>
                                 )
-                              })}
+                              })()}
                             </div>
-                          </div>
-                        )
-                      })}
+                          )
+                        })
+                    })()}
                   </div>
                 </div>
               )}
