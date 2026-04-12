@@ -62,13 +62,33 @@ function parseGitHubUrl(url) {
   return m ? { owner: m[1], repo: m[2].replace(/\.git$/, '') } : null;
 }
 
-// Simple in-memory cache (5 min TTL)
+// Simple in-memory cache (10 min TTL)
 const cache = new Map();
-const CACHE_TTL = 5 * 60 * 1000;
+const CACHE_TTL = 10 * 60 * 1000;
+
+// Sweep expired cache entries every 30 min to prevent memory leak
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, val] of cache) {
+    if (now - val.time >= CACHE_TTL) cache.delete(key);
+  }
+}, 30 * 60 * 1000);
+
+// Cap persistent stats caches to prevent unbounded file growth
+const MAX_STATS_ENTRIES = 10000;
+function trimStatsCache(obj) {
+  const keys = Object.keys(obj);
+  if (keys.length <= MAX_STATS_ENTRIES) return obj;
+  const keep = keys.slice(-Math.floor(MAX_STATS_ENTRIES / 2));
+  const trimmed = {};
+  for (const k of keep) trimmed[k] = obj[k];
+  return trimmed;
+}
 
 async function githubFetch(endpoint) {
   const cached = cache.get(endpoint);
   if (cached && Date.now() - cached.time < CACHE_TTL) return cached.data;
+  if (cached) cache.delete(endpoint); // evict expired entry
 
   const config = await readJSON(CONFIG_FILE);
   const token = process.env.GITHUB_TOKEN || config.githubToken;
@@ -218,45 +238,26 @@ app.get('/api/activity', async (req, res) => {
 
     const results = await Promise.allSettled(
       repos.map(async (repo) => {
-        // Get all branches
-        const branches = await githubFetch(`/repos/${repo.id}/branches?per_page=100`);
-        const branchList = Array.isArray(branches) ? branches : [];
-
-        // Fetch commits from each branch in parallel
-        const branchResults = await Promise.allSettled(
-          branchList.map(async (branch) => {
-            let endpoint = `/repos/${repo.id}/commits?sha=${encodeURIComponent(branch.name)}&per_page=100`;
-            if (since) endpoint += `&since=${since}`;
-            if (until) endpoint += `&until=${until}`;
-            if (author) endpoint += `&author=${author}`;
-            const commits = await githubFetch(endpoint);
-            return { branch: branch.name, commits: Array.isArray(commits) ? commits : [] };
-          })
-        );
-
-        // Deduplicate by SHA, keep branch info
-        const seen = new Map();
-        for (const br of branchResults) {
-          if (br.status !== 'fulfilled') continue;
-          for (const c of br.value.commits) {
-            if (!seen.has(c.sha)) {
-              seen.set(c.sha, {
-                sha: c.sha,
-                message: c.commit.message,
-                author: c.commit.author.name,
-                date: c.commit.author.date,
-                url: c.html_url,
-                branch: br.value.branch,
-              });
-            }
-          }
-        }
+        // Fetch commits from default branch (1 request per repo, not N per branch)
+        let endpoint = `/repos/${repo.id}/commits?per_page=100`;
+        if (since) endpoint += `&since=${since}`;
+        if (until) endpoint += `&until=${until}`;
+        if (author) endpoint += `&author=${author}`;
+        const commits = await githubFetch(endpoint);
+        const commitList = Array.isArray(commits) ? commits : [];
 
         return {
           repo: repo.id,
           repoUrl: repo.url,
-          branches: branchList.map(b => b.name),
-          commits: [...seen.values()].sort((a, b) => b.date.localeCompare(a.date)),
+          branches: [],
+          commits: commitList.map(c => ({
+            sha: c.sha,
+            message: c.commit.message,
+            author: c.commit.author.name,
+            date: c.commit.author.date,
+            url: c.html_url,
+            branch: '',
+          })),
         };
       })
     );
@@ -285,8 +286,8 @@ app.get('/api/activity', async (req, res) => {
         const data = await githubFetch(`/repos/${repoId}/commits/${sha}`).catch(() => null);
         if (data?.stats) commitStats[sha] = { additions: data.stats.additions, deletions: data.stats.deletions };
       }, 5);
-      _commitStats = commitStats;
-      writeJSON(COMMIT_STATS_FILE, commitStats).catch(() => {});
+      _commitStats = trimStatsCache(commitStats);
+      writeJSON(COMMIT_STATS_FILE, _commitStats).catch(() => {});
     }
     for (const ra of activity) {
       for (const c of ra.commits) {
@@ -361,16 +362,20 @@ app.get('/api/prs', async (req, res) => {
     for (const rp of prs) {
       for (const pr of rp.prs) {
         const key = `${rp.repo}#${pr.number}`;
-        if (!prStats[key]) prToFetch.push({ repoId: rp.repo, number: pr.number, key });
+        if (!prStats[key]) {
+          prToFetch.push({ repoId: rp.repo, number: pr.number, key });
+          if (prToFetch.length >= 50) break;
+        }
       }
+      if (prToFetch.length >= 50) break;
     }
     if (prToFetch.length > 0) {
       await pLimit(prToFetch, async ({ repoId, number, key }) => {
         const data = await githubFetch(`/repos/${repoId}/pulls/${number}`).catch(() => null);
         if (data?.additions != null) prStats[key] = { additions: data.additions, deletions: data.deletions };
       }, 5);
-      _prStats = prStats;
-      writeJSON(PR_STATS_FILE, prStats).catch(() => {});
+      _prStats = trimStatsCache(prStats);
+      writeJSON(PR_STATS_FILE, _prStats).catch(() => {});
     }
     for (const rp of prs) {
       for (const pr of rp.prs) {
@@ -395,13 +400,10 @@ app.get('/api/rate-limit', async (_req, res) => {
 // Learn Knowledge Base — Multi-directory support
 // =====================
 const LEARN_DIRS_FILE = path.join(DATA_DIR, 'learn-dirs.json');
-const DEFAULT_LEARN_DIR = path.resolve(__dirname, '..');
 
-// Initialize learn-dirs.json with default if missing
+// Initialize learn-dirs.json as empty if missing — users add their own directories via the UI
 if (!existsSync(LEARN_DIRS_FILE)) {
-  writeFileSync(LEARN_DIRS_FILE, JSON.stringify([
-    { id: 'learn', name: 'Learn', path: DEFAULT_LEARN_DIR }
-  ], null, 2));
+  writeFileSync(LEARN_DIRS_FILE, '[]');
 }
 
 async function getLearnDirs() {
@@ -422,7 +424,7 @@ async function resolvePath(prefixedPath) {
   const dir = dirs.find(d => d.id === dirId);
   if (!dir) throw new Error(`Unknown directory: ${dirId}`);
   const fullPath = rel ? path.join(dir.path, rel) : dir.path;
-  if (!fullPath.startsWith(dir.path)) throw new Error('Path traversal');
+  if (fullPath !== dir.path && !fullPath.startsWith(dir.path + '/')) throw new Error('Path traversal');
   return { dir, fullPath, rel, dirId };
 }
 
@@ -506,9 +508,7 @@ app.get('/api/tree', async (_req, res) => {
     const dirs = await getLearnDirs();
     const roots = [];
     for (const d of dirs) {
-      // For the default learn dir, ignore 'learn-dashboard' subfolder
-      const ignore = d.path === DEFAULT_LEARN_DIR ? ['learn-dashboard'] : [];
-      const children = await buildTree(d.path, '', ignore);
+      const children = await buildTree(d.path, '', []);
       roots.push({ name: d.name, path: d.id, type: 'dir', children: prefixPaths(children, d.id), _isRoot: true });
     }
     // If only one dir, return its children directly for cleaner UX
@@ -744,7 +744,9 @@ async function rebuildStats() {
     let totalCost = 0;
     let projectUsage = {};
     try {
-      const out = execSync('ccusage daily --instances --json', { encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024 });
+      const ccusageBin = path.join(__dirname, 'node_modules', '.bin', 'ccusage');
+      const ccusageCmd = existsSync(ccusageBin) ? ccusageBin : 'ccusage';
+      const out = execSync(`${ccusageCmd} daily --instances --json`, { encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024 });
       const ccusageJson = JSON.parse(out);
 
       // Per-day rollup buckets for the existing chart fields

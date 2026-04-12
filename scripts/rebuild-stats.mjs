@@ -127,10 +127,12 @@ async function scanSessions() {
   // Pull token + cost data from ccusage (live LiteLLM pricing — no manual price table)
   let ccusageJson;
   try {
-    const out = execSync('ccusage daily --json', { encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024 });
+    const ccusageBin = path.join(path.dirname(import.meta.dirname), 'node_modules', '.bin', 'ccusage');
+    const ccusageCmd = existsSync(ccusageBin) ? ccusageBin : 'ccusage';
+    const out = execSync(`${ccusageCmd} daily --json`, { encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024 });
     ccusageJson = JSON.parse(out);
   } catch (e) {
-    console.error('ccusage failed — install via `brew install ccusage` or `npm i -g ccusage`');
+    console.error('ccusage failed — run `npm install` to install it');
     throw e;
   }
 
