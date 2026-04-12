@@ -36,6 +36,8 @@ interface Commit {
   date: string
   url: string
   branch: string
+  additions?: number
+  deletions?: number
 }
 
 interface RepoActivity {
@@ -58,6 +60,8 @@ interface PR {
   mergedAt: string | null
   closedAt: string | null
   url: string
+  additions?: number
+  deletions?: number
 }
 
 interface RepoPRs {
@@ -86,7 +90,7 @@ interface ClaudeStats {
   totalMessages: number
   totalCostUSD?: number
   hourCounts: Record<string, number>
-  firstSessionDate: string
+  firstSessionDate: string | null
 }
 
 interface ClaudePing {
@@ -111,10 +115,20 @@ function formatUSD(v: number) {
   return v >= 1000 ? `$${(v / 1000).toFixed(1)}k` : v >= 1 ? `$${v.toFixed(2)}` : `$${v.toFixed(3)}`
 }
 
+const DATE_KEY_RE = /^\d{4}-\d{2}-\d{2}$/
+
+function parseCalendarDate(value: string) {
+  if (DATE_KEY_RE.test(value)) {
+    const [year, month, day] = value.split('-').map(Number)
+    return new Date(year, month - 1, day)
+  }
+  return new Date(value)
+}
+
 // "today" / "yesterday" / "Nd ago" / "Nw ago" / "Nmo ago" / "Ny ago" — based on date-only diff
 function formatRelativeTime(iso: string): string {
   if (!iso) return ''
-  const then = new Date(iso + 'T00:00:00')
+  const then = parseCalendarDate(iso)
   const now = new Date()
   const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate())
   const diffDays = Math.floor((startOfToday.getTime() - then.getTime()) / 86400000)
@@ -291,7 +305,7 @@ export default function TrackerApp() {
   const [claudeStats, setClaudeStats] = useState<ClaudeStats | null>(null)
   const [claudePings, setClaudePings] = useState<ClaudePing[]>([])
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set())
-  const [activityDate, setActivityDate] = useState(() => new Date().toISOString().slice(0, 10))
+  const [activityDate, setActivityDate] = useState(() => toDateKey(new Date()))
   const [activityView, setActivityView] = useState<'day' | 'week' | 'month' | 'projects'>('day')
   const [showActivityCal, setShowActivityCal] = useState(false)
   const [blockTooltip, setBlockTooltip] = useState<{ text: string; x: number; y: number; trackId: string } | null>(null)
@@ -624,7 +638,7 @@ export default function TrackerApp() {
     const today = new Date()
     today.setHours(0, 0, 0, 0)
     // Start from the earliest data point (with 1 week padding)
-    const firstDate = claudeStats.firstSessionDate ? new Date(claudeStats.firstSessionDate) : new Date(today)
+    const firstDate = claudeStats.firstSessionDate ? parseCalendarDate(claudeStats.firstSessionDate) : new Date(today)
     firstDate.setHours(0, 0, 0, 0)
     const start = new Date(firstDate)
     start.setDate(start.getDate() - 7) // 1 week padding
@@ -668,7 +682,7 @@ export default function TrackerApp() {
 
     const totalMessages = claudeStats.dailyActivity.reduce((s, d) => s + d.messageCount, 0)
     const firstDateStr = claudeStats.firstSessionDate
-      ? new Date(claudeStats.firstSessionDate).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })
+      ? parseCalendarDate(claudeStats.firstSessionDate).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })
       : ''
 
     return { weeks, maxCount, monthLabels, totalMessages, firstDateStr }
@@ -718,7 +732,7 @@ export default function TrackerApp() {
       },
       xAxis: {
         type: 'category' as const,
-        data: last30.map(d => { const dt = new Date(d.date + 'T00:00:00'); return dt.toLocaleDateString([], { month: 'short', day: 'numeric' }) }),
+        data: last30.map(d => { const dt = parseCalendarDate(d.date); return dt.toLocaleDateString([], { month: 'short', day: 'numeric' }) }),
         axisLabel: { color: resolve('var(--text-muted)'), fontSize: 10, interval: (_i: number) => _i % Math.ceil(last30.length / 8) === 0 },
         axisLine: { lineStyle: { color: resolve('var(--border-light)') } },
         axisTick: { show: false },
@@ -786,7 +800,7 @@ export default function TrackerApp() {
       },
       xAxis: {
         type: 'category' as const,
-        data: last30.map(d => { const dt = new Date(d.date + 'T00:00:00'); return dt.toLocaleDateString([], { month: 'short', day: 'numeric' }) }),
+        data: last30.map(d => { const dt = parseCalendarDate(d.date); return dt.toLocaleDateString([], { month: 'short', day: 'numeric' }) }),
         axisLabel: { color: resolve('var(--text-muted)'), fontSize: 10, interval: (_i: number) => _i % Math.ceil(last30.length / 8) === 0 },
         axisLine: { lineStyle: { color: resolve('var(--border-light)') } },
         axisTick: { show: false },
@@ -936,7 +950,7 @@ export default function TrackerApp() {
   // Week view: 7 days of activity tracks
   const activityWeek = useMemo(() => {
     if (!claudePings.length) return null
-    const baseDate = new Date(activityDate + 'T00:00:00')
+    const baseDate = parseCalendarDate(activityDate)
     const dayOfWeek = baseDate.getDay()
     const monday = new Date(baseDate)
     monday.setDate(monday.getDate() - ((dayOfWeek + 6) % 7))
@@ -964,7 +978,7 @@ export default function TrackerApp() {
     const cs = getComputedStyle(root)
     const resolve = (v: string) => { const m = v.match(/var\((.+)\)/); return m ? cs.getPropertyValue(m[1]).trim() || '#888' : v }
 
-    const baseDate = new Date(activityDate + 'T00:00:00')
+    const baseDate = parseCalendarDate(activityDate)
     const year = baseDate.getFullYear()
     const month = baseDate.getMonth()
     const daysInMonth = new Date(year, month + 1, 0).getDate()
@@ -1097,6 +1111,8 @@ export default function TrackerApp() {
   const totalCommits = activity.reduce((sum, a) => sum + a.commits.length, 0)
   const totalPRs = prData.reduce((sum, r) => sum + r.prs.length, 0)
   const activePRRepos = prData.filter(r => r.prs.length > 0)
+  const totalCommitLines = activity.reduce((sum, a) => sum + a.commits.reduce((s, c) => s + (c.additions ?? 0), 0), 0)
+  const totalPRLines = prData.reduce((sum, r) => sum + r.prs.reduce((s, p) => s + (p.additions ?? 0), 0), 0)
   const showDate = dateRange !== 'today' && dateRange !== 'custom'
 
   const handleCalendarSelect = (d: Date) => {
@@ -1117,7 +1133,7 @@ export default function TrackerApp() {
         const h = parseInt(d)
         return h === 0 ? '12am' : h < 12 ? `${h}am` : h === 12 ? '12pm' : `${h - 12}pm`
       }
-      const dt = new Date(d + 'T00:00:00')
+      const dt = parseCalendarDate(d)
       return dt.toLocaleDateString([], { month: 'short', day: 'numeric' })
     })
 
@@ -1387,6 +1403,14 @@ export default function TrackerApp() {
           <div className="t-stat-label">{viewTab === 'commits' ? 'Commits' : 'PRs'}</div>
         </div>
         <div className="t-stat">
+          <div className="t-stat-val t-lines-total">
+            {(viewTab === 'commits' ? totalCommitLines : totalPRLines) > 0
+              ? `+${(viewTab === 'commits' ? totalCommitLines : totalPRLines).toLocaleString()}`
+              : '—'}
+          </div>
+          <div className="t-stat-label">Lines Added</div>
+        </div>
+        <div className="t-stat">
           <div className="t-stat-val">{repos.length}</div>
           <div className="t-stat-label">Tracked</div>
         </div>
@@ -1431,7 +1455,11 @@ export default function TrackerApp() {
           ) : (
             activeRepos
               .sort((a, b) => (b.commits[0]?.date || '').localeCompare(a.commits[0]?.date || ''))
-              .map(ra => (
+              .map(ra => {
+                const repoAdd = ra.commits.reduce((s, c) => s + (c.additions ?? 0), 0)
+                const repoDel = ra.commits.reduce((s, c) => s + (c.deletions ?? 0), 0)
+                const hasStats = ra.commits.some(c => c.additions != null)
+                return (
                 <div key={ra.repo} className="t-repo">
                   <div className="t-repo-head">
                     <div className="t-repo-name">
@@ -1440,9 +1468,17 @@ export default function TrackerApp() {
                       <span className="t-owner">{ra.repo.split('/')[0]}</span>
                       <span className="t-badge">{ra.commits.length}</span>
                     </div>
-                    <a href={ra.repoUrl} target="_blank" rel="noopener noreferrer" className="t-ext-link">
-                      <ExternalLink size={13} />
-                    </a>
+                    <div className="t-repo-head-right">
+                      {hasStats && (
+                        <span className="t-repo-lines">
+                          <span className="t-lines-add">+{repoAdd.toLocaleString()}</span>
+                          <span className="t-lines-del">-{repoDel.toLocaleString()}</span>
+                        </span>
+                      )}
+                      <a href={ra.repoUrl} target="_blank" rel="noopener noreferrer" className="t-ext-link">
+                        <ExternalLink size={13} />
+                      </a>
+                    </div>
                   </div>
                   <div className="t-commits">
                     {ra.commits.map(c => (
@@ -1460,15 +1496,22 @@ export default function TrackerApp() {
                         >
                           {c.message.split('\n')[0]}
                         </a>
+                        {(c.additions != null || c.deletions != null) ? (
+                          <span className="t-lines">
+                            <span className="t-lines-add">+{c.additions ?? 0}</span>
+                            <span className="t-lines-del">-{c.deletions ?? 0}</span>
+                          </span>
+                        ) : <span className="t-lines t-lines-empty" />}
                         <span className="t-sha">{c.sha.slice(0, 7)}</span>
                       </div>
                     ))}
                   </div>
                 </div>
-              ))
-          )}
-        </div>
-      )}
+                )
+              })
+            )}
+          </div>
+        )}
 
       {/* PRs View */}
       {viewTab === 'prs' && (
@@ -1493,7 +1536,11 @@ export default function TrackerApp() {
           ) : (
             activePRRepos
               .sort((a, b) => (b.prs[0]?.updatedAt || '').localeCompare(a.prs[0]?.updatedAt || ''))
-              .map(rp => (
+              .map(rp => {
+                const prAdd = rp.prs.reduce((s, p) => s + (p.additions ?? 0), 0)
+                const prDel = rp.prs.reduce((s, p) => s + (p.deletions ?? 0), 0)
+                const hasStats = rp.prs.some(p => p.additions != null)
+                return (
                 <div key={rp.repo} className="t-repo">
                   <div className="t-repo-head">
                     <div className="t-repo-name">
@@ -1502,9 +1549,17 @@ export default function TrackerApp() {
                       <span className="t-owner">{rp.repo.split('/')[0]}</span>
                       <span className="t-badge">{rp.prs.length}</span>
                     </div>
-                    <a href={rp.repoUrl} target="_blank" rel="noopener noreferrer" className="t-ext-link">
-                      <ExternalLink size={13} />
-                    </a>
+                    <div className="t-repo-head-right">
+                      {hasStats && (
+                        <span className="t-repo-lines">
+                          <span className="t-lines-add">+{prAdd.toLocaleString()}</span>
+                          <span className="t-lines-del">-{prDel.toLocaleString()}</span>
+                        </span>
+                      )}
+                      <a href={rp.repoUrl} target="_blank" rel="noopener noreferrer" className="t-ext-link">
+                        <ExternalLink size={13} />
+                      </a>
+                    </div>
                   </div>
                   <div className="t-pr-list">
                     {rp.prs.map(pr => (
@@ -1522,6 +1577,12 @@ export default function TrackerApp() {
                           {pr.title}
                         </a>
                         <span className="t-branch-tag">{pr.branch}</span>
+                        {(pr.additions != null || pr.deletions != null) ? (
+                          <span className="t-lines">
+                            <span className="t-lines-add">+{pr.additions ?? 0}</span>
+                            <span className="t-lines-del">-{pr.deletions ?? 0}</span>
+                          </span>
+                        ) : <span className="t-lines t-lines-empty" />}
                         <span className="t-pr-meta">
                           #{pr.number} · {formatDateTime(pr.updatedAt, showDate)}
                         </span>
@@ -1529,10 +1590,11 @@ export default function TrackerApp() {
                     ))}
                   </div>
                 </div>
-              ))
-          )}
-        </div>
-      )}
+                )
+              })
+            )}
+          </div>
+        )}
 
       {/* Claude Usage View */}
       {viewTab === 'claude' && (
@@ -1564,7 +1626,7 @@ export default function TrackerApp() {
             <>
               {/* Claude Stats Cards */}
               <div className="t-claude-since">
-                All time since {new Date(claudeStats.firstSessionDate).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })}
+                All time since {claudeStats.firstSessionDate ? parseCalendarDate(claudeStats.firstSessionDate).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }) : 'N/A'}
                 <span className="t-claude-updated">Last updated: {claudeStats.lastComputedDate}</span>
               </div>
               <div className="t-stats" style={{ gridTemplateColumns: 'repeat(4, 1fr)' }}>
@@ -1708,13 +1770,13 @@ export default function TrackerApp() {
                       >
                         <Calendar size={14} />
                         <span>{activityView === 'month'
-                          ? new Date(activityDate + 'T00:00:00').toLocaleDateString([], { month: 'short', year: 'numeric' })
-                          : new Date(activityDate + 'T00:00:00').toLocaleDateString([], { month: 'short', day: 'numeric' })
+                          ? parseCalendarDate(activityDate).toLocaleDateString([], { month: 'short', year: 'numeric' })
+                          : parseCalendarDate(activityDate).toLocaleDateString([], { month: 'short', day: 'numeric' })
                         }</span>
                       </button>
                       {showActivityCal && (
                         <MiniCalendar
-                          selectedDate={new Date(activityDate + 'T00:00:00')}
+                          selectedDate={parseCalendarDate(activityDate)}
                           onSelect={(d) => { setActivityDate(toDateKey(d)); setShowActivityCal(false) }}
                           commitsByDate={pingsByDate}
                         />
@@ -1864,7 +1926,7 @@ export default function TrackerApp() {
                     )
                   })() : (
                     <div className="t-hourly-empty">
-                      No activity for {new Date(activityDate + 'T00:00:00').toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })}
+                      No activity for {parseCalendarDate(activityDate).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })}
                       <span className="t-hourly-empty-hint">Data records automatically via Claude Code hooks on every response</span>
                     </div>
                   )
@@ -2048,7 +2110,7 @@ export default function TrackerApp() {
                                     </div>
                                     {proj.dailyBreakdown.map(day => {
                                       const dayModels = Object.entries(day.models).sort((a, b) => b[1].costUSD - a[1].costUSD)
-                                      const d = new Date(day.date + 'T00:00:00')
+                                      const d = parseCalendarDate(day.date)
                                       const weekday = d.toLocaleDateString([], { weekday: 'short' })
                                       const monthDay = d.toLocaleDateString([], { month: 'short', day: 'numeric' })
                                       const pct = (day.totalCostUSD / maxDayCost) * 100

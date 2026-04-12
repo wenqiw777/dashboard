@@ -122,7 +122,7 @@ async function scanSessions() {
 
   // Use earliest date from any activity (not just user messages)
   const earliestDate = sortedDates.length > 0 ? sortedDates[0] : firstDate;
-  const firstSessionDate = earliestDate ? new Date(earliestDate).toISOString() : null;
+  const firstSessionDate = earliestDate || null;
 
   // Pull token + cost data from ccusage (live LiteLLM pricing — no manual price table)
   let ccusageJson;
@@ -176,7 +176,7 @@ async function scanSessions() {
   const totalCost = ccusageJson.totals.totalCost;
 
   const result = {
-    version: 3,
+    version: 4,
     lastComputedDate: (() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; })(),
     dailyActivity: dailyActivityArr,
     dailyModelTokens: dailyModelTokensArr,

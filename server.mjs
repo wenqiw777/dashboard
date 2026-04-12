@@ -16,14 +16,46 @@ app.use(express.json({ limit: '10mb' }));
 const DATA_DIR = path.join(__dirname, 'data');
 const REPOS_FILE = path.join(DATA_DIR, 'repos.json');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
+const COMMIT_STATS_FILE = path.join(DATA_DIR, 'commit-stats.json');
+const PR_STATS_FILE = path.join(DATA_DIR, 'pr-stats.json');
 
 if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
 if (!existsSync(REPOS_FILE)) writeFileSync(REPOS_FILE, '[]');
 if (!existsSync(CONFIG_FILE)) writeFileSync(CONFIG_FILE, '{}');
+if (!existsSync(COMMIT_STATS_FILE)) writeFileSync(COMMIT_STATS_FILE, '{}');
+if (!existsSync(PR_STATS_FILE)) writeFileSync(PR_STATS_FILE, '{}');
 
 // Helpers
 async function readJSON(file) { return JSON.parse(await fs.readFile(file, 'utf-8')); }
 async function writeJSON(file, data) { await fs.writeFile(file, JSON.stringify(data, null, 2)); }
+
+// In-memory write-through caches for stats (persist across requests without re-reading file)
+let _commitStats = null;
+let _prStats = null;
+
+async function getCommitStats() {
+  if (!_commitStats) _commitStats = await readJSON(COMMIT_STATS_FILE).catch(() => ({}));
+  return _commitStats;
+}
+
+async function getPRStats() {
+  if (!_prStats) _prStats = await readJSON(PR_STATS_FILE).catch(() => ({}));
+  return _prStats;
+}
+
+// Concurrency-limited map: runs fn on each item with at most `limit` in parallel
+async function pLimit(items, fn, limit = 5) {
+  const results = new Array(items.length);
+  let idx = 0;
+  async function worker() {
+    while (idx < items.length) {
+      const i = idx++;
+      try { results[i] = await fn(items[i]); } catch { results[i] = null; }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
 
 function parseGitHubUrl(url) {
   const m = url.match(/github\.com\/([^/]+)\/([^/\s?#]+)/);
@@ -236,6 +268,33 @@ app.get('/api/activity', async (req, res) => {
       else errors.push({ repo: repos[i].id, error: r.reason?.message || 'Unknown error' });
     });
 
+    // Enrich commits with line stats (from local cache; fetch uncached ones, cap at 50 per request)
+    const commitStats = await getCommitStats();
+    const toFetch = [];
+    for (const ra of activity) {
+      for (const c of ra.commits) {
+        if (!commitStats[c.sha]) {
+          toFetch.push({ repoId: ra.repo, sha: c.sha });
+          if (toFetch.length >= 50) break;
+        }
+      }
+      if (toFetch.length >= 50) break;
+    }
+    if (toFetch.length > 0) {
+      await pLimit(toFetch, async ({ repoId, sha }) => {
+        const data = await githubFetch(`/repos/${repoId}/commits/${sha}`).catch(() => null);
+        if (data?.stats) commitStats[sha] = { additions: data.stats.additions, deletions: data.stats.deletions };
+      }, 5);
+      _commitStats = commitStats;
+      writeJSON(COMMIT_STATS_FILE, commitStats).catch(() => {});
+    }
+    for (const ra of activity) {
+      for (const c of ra.commits) {
+        const s = commitStats[c.sha];
+        if (s) { c.additions = s.additions; c.deletions = s.deletions; }
+      }
+    }
+
     res.json({ activity, errors });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -283,8 +342,6 @@ app.get('/api/prs', async (req, res) => {
             mergedAt: pr.merged_at,
             closedAt: pr.closed_at,
             url: pr.html_url,
-            additions: pr.additions,
-            deletions: pr.deletions,
             reviewComments: pr.review_comments,
           })),
         };
@@ -297,6 +354,30 @@ app.get('/api/prs', async (req, res) => {
       if (r.status === 'fulfilled') prs.push(r.value);
       else errors.push({ repo: repos[i].id, error: r.reason?.message || 'Unknown error' });
     });
+
+    // Enrich PRs with line stats from local cache; fetch uncached ones
+    const prStats = await getPRStats();
+    const prToFetch = [];
+    for (const rp of prs) {
+      for (const pr of rp.prs) {
+        const key = `${rp.repo}#${pr.number}`;
+        if (!prStats[key]) prToFetch.push({ repoId: rp.repo, number: pr.number, key });
+      }
+    }
+    if (prToFetch.length > 0) {
+      await pLimit(prToFetch, async ({ repoId, number, key }) => {
+        const data = await githubFetch(`/repos/${repoId}/pulls/${number}`).catch(() => null);
+        if (data?.additions != null) prStats[key] = { additions: data.additions, deletions: data.deletions };
+      }, 5);
+      _prStats = prStats;
+      writeJSON(PR_STATS_FILE, prStats).catch(() => {});
+    }
+    for (const rp of prs) {
+      for (const pr of rp.prs) {
+        const s = prStats[`${rp.repo}#${pr.number}`];
+        if (s) { pr.additions = s.additions; pr.deletions = s.deletions; }
+      }
+    }
 
     res.json({ prs, errors });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -759,12 +840,12 @@ async function rebuildStats() {
     const earliestDate = sortedDates.length > 0 ? sortedDates[0] : firstDate;
 
     const result = {
-      version: 5, lastComputedDate: todayStr(),
+      version: 6, lastComputedDate: todayStr(),
       dailyActivity: dailyActivityArr, dailyModelTokens: dailyModelTokensArr, dailyCost: dailyCostArr,
       modelUsage, projectUsage, totalSessions: sessions.size,
       totalMessages: dailyActivityArr.reduce((s, d) => s + d.messageCount, 0),
       totalCostUSD: totalCost, longestSession,
-      firstSessionDate: earliestDate ? new Date(earliestDate).toISOString() : null,
+      firstSessionDate: earliestDate || null,
       hourCounts, totalSpeculationTimeSavedMs: 0, shotDistribution: {},
     };
 
@@ -780,7 +861,7 @@ async function rebuildStats() {
 // Rebuild on server start
 rebuildStats();
 
-const STATS_SCHEMA_VERSION = 5;
+const STATS_SCHEMA_VERSION = 6;
 
 app.get('/api/claude-stats', async (_req, res) => {
   try {
