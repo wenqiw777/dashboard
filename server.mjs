@@ -953,4 +953,5 @@ app.get('/api/claude-pings', async (_req, res) => {
   }
 });
 
-app.listen(8000, () => console.log('API server on :8000'));
+const port = process.env.PORT || 8000;
+app.listen(port, () => console.log(`API server on :${port}`));

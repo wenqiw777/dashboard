@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently \"node server.mjs\" \"vite\"",
+    "dev": "concurrently \"portless api.victorz --app-port 4568 node server.mjs\" \"portless victorz vite\"",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview"
