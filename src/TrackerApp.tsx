@@ -27,6 +27,7 @@ interface Repo {
 interface Config {
   githubUsername: string
   hasToken: boolean
+  authorAliases: string[]
 }
 
 interface Commit {
@@ -97,6 +98,17 @@ interface ClaudePing {
   ts: string
   session: string
   project: string
+  host?: string
+}
+
+interface RemoteHost {
+  id: string
+  label: string
+  sshTarget: string
+  projectsPath: string
+  lastSyncAt: string | null
+  lastSyncOk: boolean | null
+  lastSyncError?: string
 }
 
 // Claude logo icon
@@ -284,7 +296,7 @@ function MiniCalendar({ selectedDate, onSelect, commitsByDate }: {
 
 export default function TrackerApp() {
   const [repos, setRepos] = useState<Repo[]>([])
-  const [config, setConfig] = useState<Config>({ githubUsername: '', hasToken: false })
+  const [config, setConfig] = useState<Config>({ githubUsername: '', hasToken: false, authorAliases: [] })
   const [activity, setActivity] = useState<RepoActivity[]>([])
   const [prData, setPrData] = useState<RepoPRs[]>([])
   const [fetchErrors, setFetchErrors] = useState<{ repo: string; error: string }[]>([])
@@ -297,13 +309,16 @@ export default function TrackerApp() {
   const [initialized, setInitialized] = useState(false)
   const [repoUrl, setRepoUrl] = useState('')
   const [showSettings, setShowSettings] = useState(false)
-  const [settingsForm, setSettingsForm] = useState({ githubUsername: '', githubToken: '' })
+  const [settingsForm, setSettingsForm] = useState({ githubUsername: '', githubToken: '', authorAliases: '' })
   const [error, setError] = useState<string | null>(null)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   // Full month data for chart + calendar dots
   const [monthActivity, setMonthActivity] = useState<RepoActivity[]>([])
   const [claudeStats, setClaudeStats] = useState<ClaudeStats | null>(null)
   const [claudePings, setClaudePings] = useState<ClaudePing[]>([])
+  const [remoteHosts, setRemoteHosts] = useState<RemoteHost[]>([])
+  const [remoteForm, setRemoteForm] = useState({ id: '', label: '', sshTarget: '', projectsPath: '~/.claude/projects' })
+  const [remoteSyncing, setRemoteSyncing] = useState<string | null>(null) // host id currently syncing, or 'all'
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set())
   const [activityDate, setActivityDate] = useState(() => toDateKey(new Date()))
   const [activityView, setActivityView] = useState<'day' | 'week' | 'month' | 'projects'>('day')
@@ -332,6 +347,13 @@ export default function TrackerApp() {
     } catch { /* silent */ }
   }, [])
 
+  const loadRemoteHosts = useCallback(async () => {
+    try {
+      const res = await fetch('/api/remote-hosts')
+      if (res.ok) setRemoteHosts(await res.json())
+    } catch { /* silent */ }
+  }, [])
+
   useEffect(() => {
     (async () => {
       try {
@@ -342,15 +364,16 @@ export default function TrackerApp() {
         const configData = await configRes.json()
         setRepos(reposData)
         setConfig(configData)
-        setSettingsForm({ githubUsername: configData.githubUsername || '', githubToken: '' })
+        setSettingsForm({ githubUsername: configData.githubUsername || '', githubToken: '', authorAliases: (configData.authorAliases || []).join(', ') })
         if (!configData.githubUsername) setShowSettings(true)
         setInitialized(true)
         loadClaudeStats()
+        loadRemoteHosts()
       } catch {
         setError('Failed to connect to server. Is it running?')
       }
     })()
-  }, [loadClaudeStats])
+  }, [loadClaudeStats, loadRemoteHosts])
 
   // Auto-refresh claude stats every 60s
   useEffect(() => {
@@ -608,7 +631,8 @@ export default function TrackerApp() {
 
   const handleSaveConfig = async () => {
     try {
-      const body: Record<string, string> = { githubUsername: settingsForm.githubUsername }
+      const aliases = settingsForm.authorAliases.split(',').map(s => s.trim()).filter(Boolean)
+      const body: Record<string, unknown> = { githubUsername: settingsForm.githubUsername, authorAliases: aliases }
       if (settingsForm.githubToken) body.githubToken = settingsForm.githubToken
       await fetch('/api/config', {
         method: 'PUT',
@@ -618,12 +642,58 @@ export default function TrackerApp() {
       setConfig(prev => ({
         ...prev,
         githubUsername: settingsForm.githubUsername,
-        hasToken: settingsForm.githubToken ? true : prev.hasToken
+        hasToken: settingsForm.githubToken ? true : prev.hasToken,
+        authorAliases: aliases,
       }))
       setSettingsForm(prev => ({ ...prev, githubToken: '' }))
       setShowSettings(false)
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Failed to save')
+    }
+  }
+
+  const handleAddRemoteHost = async () => {
+    const { id, label, sshTarget, projectsPath } = remoteForm
+    if (!id || !sshTarget) { setError('id and sshTarget required'); return }
+    try {
+      const res = await fetch('/api/remote-hosts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, label, sshTarget, projectsPath }),
+      })
+      if (!res.ok) { setError((await res.json()).error || 'Failed to add host'); return }
+      setRemoteForm({ id: '', label: '', sshTarget: '', projectsPath: '~/.claude/projects' })
+      loadRemoteHosts()
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Failed to add host')
+    }
+  }
+
+  const handleDeleteRemoteHost = async (id: string) => {
+    try {
+      await fetch(`/api/remote-hosts/${id}`, { method: 'DELETE' })
+      loadRemoteHosts()
+    } catch { /* silent */ }
+  }
+
+  const handleSyncRemote = async (id?: string) => {
+    setRemoteSyncing(id || 'all')
+    try {
+      const url = id ? `/api/sync-remote?id=${encodeURIComponent(id)}` : '/api/sync-remote'
+      const res = await fetch(url, { method: 'POST' })
+      if (!res.ok) { setError((await res.json()).error || 'Sync failed'); return }
+      const data = await res.json()
+      const failures = (data.results || []).filter((r: { ok: boolean }) => !r.ok)
+      if (failures.length > 0) {
+        setError(failures.map((f: { id: string; error?: string }) => `${f.id}: ${f.error}`).join(' | '))
+      }
+      await loadRemoteHosts()
+      // Stats rebuild is async on server; give it a beat then reload
+      setTimeout(loadClaudeStats, 1500)
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Sync failed')
+    } finally {
+      setRemoteSyncing(null)
     }
   }
 
@@ -1263,7 +1333,64 @@ export default function TrackerApp() {
                 {config.hasToken ? 'Token configured' : 'Optional — increases rate limit to 5000/hr'}
               </span>
             </div>
+            <div className="t-field">
+              <label>Author Aliases</label>
+              <input
+                type="text"
+                value={settingsForm.authorAliases}
+                onChange={e => setSettingsForm(f => ({ ...f, authorAliases: e.target.value }))}
+                placeholder="Jackson Wang, other-name"
+              />
+              <span className="t-hint">
+                Comma-separated git author names to include in your activity (for commits made with a different identity)
+              </span>
+            </div>
             <button className="t-btn t-btn-accent" onClick={handleSaveConfig}>Save</button>
+
+            <div className="t-field" style={{ marginTop: 20, borderTop: '1px solid var(--border-light)', paddingTop: 16 }}>
+              <label>Remote Hosts (SSH) <span style={{ fontWeight: 400, opacity: 0.6 }}>— sync Claude logs from remote machines</span></label>
+              {remoteHosts.length > 0 && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 10 }}>
+                  {remoteHosts.map(h => (
+                    <div key={h.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px', background: 'var(--bg-secondary)', borderRadius: 6, fontSize: 12 }}>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontWeight: 600 }}>{h.label} <span style={{ opacity: 0.5, fontWeight: 400 }}>({h.id})</span></div>
+                        <div style={{ opacity: 0.6, fontSize: 11, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {h.sshTarget}:{h.projectsPath}
+                        </div>
+                        {h.lastSyncAt && (
+                          <div style={{ fontSize: 11, opacity: 0.6 }}>
+                            Last sync: {formatRelativeTime(h.lastSyncAt)} · {h.lastSyncOk ? 'ok' : `failed: ${h.lastSyncError || ''}`.slice(0, 60)}
+                          </div>
+                        )}
+                      </div>
+                      <button className="t-btn" onClick={() => handleSyncRemote(h.id)} disabled={remoteSyncing !== null}>
+                        <RefreshCw size={12} /> {remoteSyncing === h.id ? 'Syncing…' : 'Sync'}
+                      </button>
+                      <button className="t-icon-btn-sm" onClick={() => handleDeleteRemoteHost(h.id)} title="Remove">
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginTop: 6 }}>
+                <input type="text" placeholder="id (e.g. dev)" value={remoteForm.id}
+                  onChange={e => setRemoteForm(f => ({ ...f, id: e.target.value }))} />
+                <input type="text" placeholder="label (e.g. dev-server)" value={remoteForm.label}
+                  onChange={e => setRemoteForm(f => ({ ...f, label: e.target.value }))} />
+                <input type="text" placeholder="ssh target (user@host or alias)" value={remoteForm.sshTarget}
+                  onChange={e => setRemoteForm(f => ({ ...f, sshTarget: e.target.value }))} />
+                <input type="text" placeholder="remote projects path" value={remoteForm.projectsPath}
+                  onChange={e => setRemoteForm(f => ({ ...f, projectsPath: e.target.value }))} />
+              </div>
+              <button className="t-btn" style={{ marginTop: 8 }} onClick={handleAddRemoteHost}>
+                <Plus size={12} /> Add remote host
+              </button>
+              <span className="t-hint">
+                Uses rsync over SSH. Requires passwordless SSH (keys or ssh-agent) and rsync installed on both ends.
+              </span>
+            </div>
           </div>
         </div>
       )}
@@ -1628,6 +1755,17 @@ export default function TrackerApp() {
               <div className="t-claude-since">
                 All time since {claudeStats.firstSessionDate ? parseCalendarDate(claudeStats.firstSessionDate).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }) : 'N/A'}
                 <span className="t-claude-updated">Last updated: {claudeStats.lastComputedDate}</span>
+                {remoteHosts.length > 0 && (
+                  <button
+                    className="t-btn"
+                    style={{ marginLeft: 'auto' }}
+                    onClick={() => handleSyncRemote()}
+                    disabled={remoteSyncing !== null}
+                    title={`Sync ${remoteHosts.length} remote host(s)`}
+                  >
+                    <RefreshCw size={12} /> {remoteSyncing ? 'Syncing…' : `Sync remote (${remoteHosts.length})`}
+                  </button>
+                )}
               </div>
               <div className="t-stats" style={{ gridTemplateColumns: 'repeat(4, 1fr)' }}>
                 <div className="t-stat">

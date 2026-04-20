@@ -3,7 +3,7 @@ import cors from 'cors';
 import fs from 'fs/promises';
 import { existsSync, mkdirSync, writeFileSync, createReadStream } from 'fs';
 import { createInterface } from 'readline';
-import { execSync } from 'child_process';
+import { execSync, spawn } from 'child_process';
 import path from 'path';
 import os from 'os';
 
@@ -18,12 +18,16 @@ const REPOS_FILE = path.join(DATA_DIR, 'repos.json');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 const COMMIT_STATS_FILE = path.join(DATA_DIR, 'commit-stats.json');
 const PR_STATS_FILE = path.join(DATA_DIR, 'pr-stats.json');
+const REMOTE_HOSTS_FILE = path.join(DATA_DIR, 'remote-hosts.json');
+const REMOTE_ROOT = path.join(os.homedir(), '.claude-remote');
+const SAFE_ID_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 
 if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
 if (!existsSync(REPOS_FILE)) writeFileSync(REPOS_FILE, '[]');
 if (!existsSync(CONFIG_FILE)) writeFileSync(CONFIG_FILE, '{}');
 if (!existsSync(COMMIT_STATS_FILE)) writeFileSync(COMMIT_STATS_FILE, '{}');
 if (!existsSync(PR_STATS_FILE)) writeFileSync(PR_STATS_FILE, '{}');
+if (!existsSync(REMOTE_HOSTS_FILE)) writeFileSync(REMOTE_HOSTS_FILE, '[]');
 
 // Helpers
 async function readJSON(file) { return JSON.parse(await fs.readFile(file, 'utf-8')); }
@@ -124,6 +128,7 @@ app.get('/api/config', async (_req, res) => {
     res.json({
       githubUsername: config.githubUsername || '',
       hasToken: !!(envToken || config.githubToken),
+      authorAliases: config.authorAliases || [],
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -131,9 +136,10 @@ app.get('/api/config', async (_req, res) => {
 app.put('/api/config', async (req, res) => {
   try {
     const existing = await readJSON(CONFIG_FILE);
-    const { githubUsername, githubToken } = req.body;
+    const { githubUsername, githubToken, authorAliases } = req.body;
     if (githubUsername !== undefined) existing.githubUsername = githubUsername;
     if (githubToken) existing.githubToken = githubToken;
+    if (authorAliases !== undefined) existing.authorAliases = authorAliases;
     await writeJSON(CONFIG_FILE, existing);
     cache.clear();
     res.json({ ok: true });
@@ -236,27 +242,81 @@ app.get('/api/activity', async (req, res) => {
     const repos = await readJSON(REPOS_FILE);
     if (repos.length === 0) return res.json({ activity: [], errors: [] });
 
+    // Build list of author queries: main username + aliases
+    const config = await readJSON(CONFIG_FILE);
+    const authorQueries = author ? [author, ...(config.authorAliases || [])] : [];
+
     const results = await Promise.allSettled(
       repos.map(async (repo) => {
-        // Fetch commits from default branch (1 request per repo, not N per branch)
-        let endpoint = `/repos/${repo.id}/commits?per_page=100`;
-        if (since) endpoint += `&since=${since}`;
-        if (until) endpoint += `&until=${until}`;
-        if (author) endpoint += `&author=${author}`;
-        const commits = await githubFetch(endpoint);
-        const commitList = Array.isArray(commits) ? commits : [];
+        // Enumerate branches so we see commits that haven't been merged to the default branch.
+        // GitHub's /commits endpoint defaults to the default branch only when sha is omitted.
+        const branchesData = await githubFetch(`/repos/${repo.id}/branches?per_page=100`).catch(() => []);
+        const branchNames = Array.isArray(branchesData) && branchesData.length > 0
+          ? branchesData.map(b => b.name)
+          : [''];
+
+        const fetchForBranch = async (branch) => {
+          const branchParam = branch ? `&sha=${encodeURIComponent(branch)}` : '';
+          let baseEndpoint = `/repos/${repo.id}/commits?per_page=100${branchParam}`;
+          if (since) baseEndpoint += `&since=${since}`;
+          if (until) baseEndpoint += `&until=${until}`;
+
+          if (authorQueries.length > 0) {
+            const aliases = authorQueries.slice(1);
+            const fetches = aliases.length > 0
+              ? await Promise.all([
+                  githubFetch(`${baseEndpoint}&author=${authorQueries[0]}`).catch(() => []),
+                  githubFetch(baseEndpoint).catch(() => []),
+                ])
+              : [await githubFetch(`${baseEndpoint}&author=${authorQueries[0]}`).catch(() => [])];
+
+            const out = [];
+            const seen = new Set();
+            for (const c of (Array.isArray(fetches[0]) ? fetches[0] : [])) {
+              if (!seen.has(c.sha)) { seen.add(c.sha); out.push(c); }
+            }
+            if (fetches[1]) {
+              for (const c of (Array.isArray(fetches[1]) ? fetches[1] : [])) {
+                if (seen.has(c.sha)) continue;
+                const name = c.commit?.author?.name || '';
+                const email = c.commit?.author?.email || '';
+                if (aliases.some(a => a === name || a === email)) {
+                  seen.add(c.sha); out.push(c);
+                }
+              }
+            }
+            return out;
+          }
+          const commits = await githubFetch(baseEndpoint);
+          return Array.isArray(commits) ? commits : [];
+        };
+
+        // Fan out across branches with bounded concurrency; dedupe by sha, keep first-seen branch.
+        const perBranch = await pLimit(branchNames, fetchForBranch, 5);
+        const seenSha = new Set();
+        const allCommits = [];
+        const commitBranch = new Map();
+        for (let i = 0; i < branchNames.length; i++) {
+          const branch = branchNames[i];
+          for (const c of (perBranch[i] || [])) {
+            if (seenSha.has(c.sha)) continue;
+            seenSha.add(c.sha);
+            allCommits.push(c);
+            commitBranch.set(c.sha, branch);
+          }
+        }
 
         return {
           repo: repo.id,
           repoUrl: repo.url,
           branches: [],
-          commits: commitList.map(c => ({
+          commits: allCommits.map(c => ({
             sha: c.sha,
             message: c.commit.message,
             author: c.commit.author.name,
             date: c.commit.committer.date,
             url: c.html_url,
-            branch: '',
+            branch: commitBranch.get(c.sha) || '',
           })),
         };
       })
@@ -640,8 +700,22 @@ app.post('/api/move', async (req, res) => {
 
 // --- Claude Usage Stats ---
 const CLAUDE_STATS_FILE = path.join(DATA_DIR, 'claude-stats.json');
-const CLAUDE_PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
+const CLAUDE_DIR = path.join(os.homedir(), '.claude');
+const CLAUDE_PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
 let statsRebuilding = false;
+
+async function getScanHosts() {
+  const remote = await getRemoteHosts().catch(() => []);
+  return [
+    { id: 'local', label: null, root: CLAUDE_DIR, projectsDir: CLAUDE_PROJECTS_DIR },
+    ...remote.map(h => ({
+      id: h.id,
+      label: h.label || h.id,
+      root: path.join(REMOTE_ROOT, h.id),
+      projectsDir: path.join(REMOTE_ROOT, h.id, 'projects'),
+    })),
+  ];
+}
 
 function todayStr() {
   const d = new Date();
@@ -659,6 +733,8 @@ async function collectJsonlFiles(dir) {
   return results;
 }
 
+const STATS_SCHEMA_VERSION = 8;
+
 async function rebuildStats() {
   if (statsRebuilding) return;
   statsRebuilding = true;
@@ -670,95 +746,106 @@ async function rebuildStats() {
       acc = JSON.parse(raw);
     } catch { /* fresh build */ }
 
+    // Schema v8 introduced host-namespaced session/projectCwd keys.
+    // Old caches (v<8) have unprefixed keys — discard seed data and rebuild fresh.
+    const seedUsable = acc && (acc.version ?? 0) >= STATS_SCHEMA_VERSION;
+    const seed = seedUsable ? acc : null;
+
     // Accumulated data structures — seed from existing stats or start empty
-    const processedFiles = new Map(Object.entries(acc?.processedFiles || {})); // path -> { size, mtimeMs }
-    const dailyActivityMap = new Map((acc?.dailyActivity || []).map(d => [d.date, d]));
-    const hourCounts = { ...(acc?.hourCounts || {}) };
-    const allSessions = new Set(acc?._sessions || []);
-    let longestSession = acc?.longestSession || null;
-    const projectCwd = { ...(acc?._projectCwd || {}) }; // preserved for ccusage display names
+    const processedFiles = new Map(Object.entries(seed?.processedFiles || {})); // path -> { size, mtimeMs }
+    const dailyActivityMap = new Map((seed?.dailyActivity || []).map(d => [d.date, d]));
+    const hourCounts = { ...(seed?.hourCounts || {}) };
+    const allSessions = new Set(seed?._sessions || []); // stored as "hostId:sessionId"
+    let longestSession = seed?.longestSession || null;
+    const projectCwd = { ...(seed?._projectCwd || {}) }; // key: "hostId:encodedDir" -> cwd
+
+    const hosts = await getScanHosts();
 
     // Scan JSONL files — skip unchanged ones (same size + mtime)
     let scannedCount = 0;
     let skippedCount = 0;
     const currentFiles = new Set(); // track which files still exist
 
-    const projectDirs = await fs.readdir(CLAUDE_PROJECTS_DIR).catch(() => []);
-    for (const projDir of projectDirs) {
-      const projPath = path.join(CLAUDE_PROJECTS_DIR, projDir);
-      const dirStat = await fs.stat(projPath).catch(() => null);
-      if (!dirStat?.isDirectory()) continue;
-      const files = await collectJsonlFiles(projPath);
+    for (const host of hosts) {
+      const projectDirs = await fs.readdir(host.projectsDir).catch(() => []);
+      for (const projDir of projectDirs) {
+        const projPath = path.join(host.projectsDir, projDir);
+        const dirStat = await fs.stat(projPath).catch(() => null);
+        if (!dirStat?.isDirectory()) continue;
+        const files = await collectJsonlFiles(projPath);
+        const projKey = `${host.id}:${projDir}`;
 
-      for (const filePath of files) {
-        currentFiles.add(filePath);
-        const fileStat = await fs.stat(filePath).catch(() => null);
-        if (!fileStat) continue;
+        for (const filePath of files) {
+          currentFiles.add(filePath);
+          const fileStat = await fs.stat(filePath).catch(() => null);
+          if (!fileStat) continue;
 
-        const prev = processedFiles.get(filePath);
-        if (prev && prev.size === fileStat.size && prev.mtimeMs === fileStat.mtimeMs) {
-          skippedCount++;
-          continue; // unchanged, skip
-        }
+          const prev = processedFiles.get(filePath);
+          if (prev && prev.size === fileStat.size && prev.mtimeMs === fileStat.mtimeMs) {
+            skippedCount++;
+            continue; // unchanged, skip
+          }
 
-        // New or changed file — scan it
-        const sessionId = path.basename(filePath, '.jsonl');
-        const isSubagent = filePath.includes('/subagents/');
-        try {
-          const rl = createInterface({ input: createReadStream(filePath), crlfDelay: Infinity });
-          for await (const line of rl) {
-            if (!line.trim()) continue;
-            let record;
-            try { record = JSON.parse(line); } catch { continue; }
+          // New or changed file — scan it
+          const baseSessionId = path.basename(filePath, '.jsonl');
+          const sessionKey = `${host.id}:${baseSessionId}`;
+          const isSubagent = filePath.includes('/subagents/');
+          try {
+            const rl = createInterface({ input: createReadStream(filePath), crlfDelay: Infinity });
+            for await (const line of rl) {
+              if (!line.trim()) continue;
+              let record;
+              try { record = JSON.parse(line); } catch { continue; }
 
-            if (!projectCwd[projDir] && typeof record.cwd === 'string' && record.cwd) {
-              projectCwd[projDir] = record.cwd;
-            }
-            const ts = record.timestamp;
-            if (!ts) continue;
-            const localDate = new Date(ts);
-            const date = `${localDate.getFullYear()}-${String(localDate.getMonth()+1).padStart(2,'0')}-${String(localDate.getDate()).padStart(2,'0')}`;
-            const hour = localDate.getHours();
-
-            if (record.type === 'user' && record.userType === 'external' && !isSubagent) {
-              allSessions.add(sessionId);
-              const day = dailyActivityMap.get(date) || { date, messageCount: 0, sessionCount: 0, toolCallCount: 0, _sessions: [] };
-              if (!dailyActivityMap.has(date)) dailyActivityMap.set(date, day);
-              if (!day._sessions) day._sessions = [];
-              if (!day._sessions.includes(sessionId)) {
-                day._sessions.push(sessionId);
-                day.sessionCount = day._sessions.length;
+              if (!projectCwd[projKey] && typeof record.cwd === 'string' && record.cwd) {
+                projectCwd[projKey] = record.cwd;
               }
-              // Track session duration
-              const meta = { sessionId, start: ts, end: ts, messageCount: 1 };
-              if (longestSession?.sessionId === sessionId) {
-                longestSession.end = ts;
-                longestSession.messageCount++;
-              }
-              const duration = new Date(ts) - new Date(meta.start);
-              if (!longestSession || duration > (longestSession.duration || 0)) {
-                longestSession = { sessionId, duration, messageCount: meta.messageCount, timestamp: meta.start };
-              }
-            }
+              const ts = record.timestamp;
+              if (!ts) continue;
+              const localDate = new Date(ts);
+              const date = `${localDate.getFullYear()}-${String(localDate.getMonth()+1).padStart(2,'0')}-${String(localDate.getDate()).padStart(2,'0')}`;
+              const hour = localDate.getHours();
 
-            if (record.type === 'assistant') {
-              const day = dailyActivityMap.get(date) || { date, messageCount: 0, sessionCount: 0, toolCallCount: 0, _sessions: [] };
-              if (!dailyActivityMap.has(date)) dailyActivityMap.set(date, day);
-              day.messageCount++;
-              hourCounts[hour] = (hourCounts[hour] || 0) + 1;
-              const msg = record.message || {};
-              if (msg.content && Array.isArray(msg.content)) {
-                for (const block of msg.content) {
-                  if (block.type === 'tool_use') day.toolCallCount++;
+              if (record.type === 'user' && record.userType === 'external' && !isSubagent) {
+                allSessions.add(sessionKey);
+                const day = dailyActivityMap.get(date) || { date, messageCount: 0, sessionCount: 0, toolCallCount: 0, _sessions: [] };
+                if (!dailyActivityMap.has(date)) dailyActivityMap.set(date, day);
+                if (!day._sessions) day._sessions = [];
+                if (!day._sessions.includes(sessionKey)) {
+                  day._sessions.push(sessionKey);
+                  day.sessionCount = day._sessions.length;
+                }
+                // Track session duration
+                const meta = { sessionId: sessionKey, start: ts, end: ts, messageCount: 1 };
+                if (longestSession?.sessionId === sessionKey) {
+                  longestSession.end = ts;
+                  longestSession.messageCount++;
+                }
+                const duration = new Date(ts) - new Date(meta.start);
+                if (!longestSession || duration > (longestSession.duration || 0)) {
+                  longestSession = { sessionId: sessionKey, duration, messageCount: meta.messageCount, timestamp: meta.start };
+                }
+              }
+
+              if (record.type === 'assistant') {
+                const day = dailyActivityMap.get(date) || { date, messageCount: 0, sessionCount: 0, toolCallCount: 0, _sessions: [] };
+                if (!dailyActivityMap.has(date)) dailyActivityMap.set(date, day);
+                day.messageCount++;
+                hourCounts[hour] = (hourCounts[hour] || 0) + 1;
+                const msg = record.message || {};
+                if (msg.content && Array.isArray(msg.content)) {
+                  for (const block of msg.content) {
+                    if (block.type === 'tool_use') day.toolCallCount++;
+                  }
                 }
               }
             }
-          }
-        } catch { /* skip unreadable */ }
+          } catch { /* skip unreadable */ }
 
-        // Mark as processed with current size + mtime
-        processedFiles.set(filePath, { size: fileStat.size, mtimeMs: fileStat.mtimeMs });
-        scannedCount++;
+          // Mark as processed with current size + mtime
+          processedFiles.set(filePath, { size: fileStat.size, mtimeMs: fileStat.mtimeMs });
+          scannedCount++;
+        }
       }
     }
 
@@ -771,104 +858,122 @@ async function rebuildStats() {
       .sort((a, b) => a.date.localeCompare(b.date))
       .map(d => ({ date: d.date, messageCount: d.messageCount, sessionCount: d.sessionCount, toolCallCount: d.toolCallCount }));
 
-    // Pull token + cost data from ccusage (live LiteLLM pricing).
-    // ccusage does its own incremental caching, so we always call it and let it handle efficiency.
+    // Pull token + cost data from ccusage (live LiteLLM pricing) — once per host.
+    // Each host's data lives under a different CLAUDE_CONFIG_DIR, so we invoke ccusage per host
+    // and aggregate.
+    const ccusageBin = path.join(__dirname, 'node_modules', '.bin', 'ccusage');
+    const ccusageCmd = existsSync(ccusageBin) ? ccusageBin : 'ccusage';
     let dailyModelTokensArr = [];
     let dailyCostArr = [];
     let modelUsage = {};
     let totalCost = 0;
     let projectUsage = {};
-    try {
-      const ccusageBin = path.join(__dirname, 'node_modules', '.bin', 'ccusage');
-      const ccusageCmd = existsSync(ccusageBin) ? ccusageBin : 'ccusage';
-      const out = execSync(`${ccusageCmd} daily --instances --json`, { encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024 });
-      const ccusageJson = JSON.parse(out);
+    const tokensByDate = {};
+    const costByDate = {};
+    let anyCcusageOk = false;
+    const ccusageErrors = [];
 
-      const tokensByDate = {};
-      const costByDate = {};
+    for (const host of hosts) {
+      try {
+        const env = { ...process.env, CLAUDE_CONFIG_DIR: host.root };
+        const out = execSync(`${ccusageCmd} daily --instances --json`, {
+          encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024, env,
+        });
+        const ccusageJson = JSON.parse(out);
 
-      for (const [encodedDir, entries] of Object.entries(ccusageJson.projects || {})) {
-        let projTotalCost = 0;
-        const projModels = {};
-        const projDailyMap = {};
-        const projDates = new Set();
-        let projFirstDate = null;
-        let projLastDate = null;
+        for (const [encodedDir, entries] of Object.entries(ccusageJson.projects || {})) {
+          let projTotalCost = 0;
+          const projModels = {};
+          const projDailyMap = {};
+          const projDates = new Set();
+          let projFirstDate = null;
+          let projLastDate = null;
 
-        for (const entry of entries) {
-          const date = entry.date;
-          projDates.add(date);
-          if (!projFirstDate || date < projFirstDate) projFirstDate = date;
-          if (!projLastDate || date > projLastDate) projLastDate = date;
+          for (const entry of entries) {
+            const date = entry.date;
+            projDates.add(date);
+            if (!projFirstDate || date < projFirstDate) projFirstDate = date;
+            if (!projLastDate || date > projLastDate) projLastDate = date;
 
-          if (!projDailyMap[date]) projDailyMap[date] = { date, totalCostUSD: 0, models: {} };
-          const dayBucket = projDailyMap[date];
+            if (!projDailyMap[date]) projDailyMap[date] = { date, totalCostUSD: 0, models: {} };
+            const dayBucket = projDailyMap[date];
 
-          for (const m of entry.modelBreakdowns) {
-            if (!projModels[m.modelName]) projModels[m.modelName] = { outputTokens: 0, costUSD: 0 };
-            projModels[m.modelName].outputTokens += m.outputTokens;
-            projModels[m.modelName].costUSD += m.cost;
-            projTotalCost += m.cost;
+            for (const m of entry.modelBreakdowns) {
+              if (!projModels[m.modelName]) projModels[m.modelName] = { outputTokens: 0, costUSD: 0 };
+              projModels[m.modelName].outputTokens += m.outputTokens;
+              projModels[m.modelName].costUSD += m.cost;
+              projTotalCost += m.cost;
 
-            if (!dayBucket.models[m.modelName]) dayBucket.models[m.modelName] = { outputTokens: 0, costUSD: 0 };
-            dayBucket.models[m.modelName].outputTokens += m.outputTokens;
-            dayBucket.models[m.modelName].costUSD += m.cost;
-            dayBucket.totalCostUSD += m.cost;
+              if (!dayBucket.models[m.modelName]) dayBucket.models[m.modelName] = { outputTokens: 0, costUSD: 0 };
+              dayBucket.models[m.modelName].outputTokens += m.outputTokens;
+              dayBucket.models[m.modelName].costUSD += m.cost;
+              dayBucket.totalCostUSD += m.cost;
 
-            if (!tokensByDate[date]) tokensByDate[date] = {};
-            tokensByDate[date][m.modelName] = (tokensByDate[date][m.modelName] || 0)
-              + m.inputTokens + m.outputTokens + m.cacheReadTokens + m.cacheCreationTokens;
-            if (!costByDate[date]) costByDate[date] = {};
-            costByDate[date][m.modelName] = (costByDate[date][m.modelName] || 0) + m.cost;
+              if (!tokensByDate[date]) tokensByDate[date] = {};
+              tokensByDate[date][m.modelName] = (tokensByDate[date][m.modelName] || 0)
+                + m.inputTokens + m.outputTokens + m.cacheReadTokens + m.cacheCreationTokens;
+              if (!costByDate[date]) costByDate[date] = {};
+              costByDate[date][m.modelName] = (costByDate[date][m.modelName] || 0) + m.cost;
 
-            if (!modelUsage[m.modelName]) {
-              modelUsage[m.modelName] = {
-                inputTokens: 0, outputTokens: 0,
-                cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
-                costUSD: 0, webSearchRequests: 0, contextWindow: 0, maxOutputTokens: 0,
-              };
+              if (!modelUsage[m.modelName]) {
+                modelUsage[m.modelName] = {
+                  inputTokens: 0, outputTokens: 0,
+                  cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+                  costUSD: 0, webSearchRequests: 0, contextWindow: 0, maxOutputTokens: 0,
+                };
+              }
+              const u = modelUsage[m.modelName];
+              u.inputTokens += m.inputTokens;
+              u.outputTokens += m.outputTokens;
+              u.cacheReadInputTokens += m.cacheReadTokens;
+              u.cacheCreationInputTokens += m.cacheCreationTokens;
+              u.costUSD += m.cost;
             }
-            const u = modelUsage[m.modelName];
-            u.inputTokens += m.inputTokens;
-            u.outputTokens += m.outputTokens;
-            u.cacheReadInputTokens += m.cacheReadTokens;
-            u.cacheCreationInputTokens += m.cacheCreationTokens;
-            u.costUSD += m.cost;
+          }
+
+          totalCost += projTotalCost;
+
+          if (projTotalCost >= 10) {
+            const projKey = `${host.id}:${encodedDir}`;
+            const cwd = projectCwd[projKey];
+            const baseName = cwd ? path.basename(cwd) : encodedDir;
+            const displayName = host.id === 'local' ? baseName : `[${host.label}] ${baseName}`;
+            const dailyBreakdown = Object.values(projDailyMap)
+              .sort((a, b) => b.date.localeCompare(a.date))
+              .slice(0, 10);
+            // Local keeps unprefixed key for backward UI compat; remote gets hostId prefix
+            const usageKey = host.id === 'local' ? encodedDir : projKey;
+            projectUsage[usageKey] = {
+              displayName, cwd: cwd || null, totalCostUSD: projTotalCost,
+              daysActive: projDates.size, firstActivity: projFirstDate,
+              lastActivity: projLastDate, models: projModels, dailyBreakdown,
+              host: host.id,
+            };
           }
         }
-
-        totalCost += projTotalCost;
-
-        if (projTotalCost >= 10) {
-          const cwd = projectCwd[encodedDir];
-          const displayName = cwd ? path.basename(cwd) : encodedDir;
-          const dailyBreakdown = Object.values(projDailyMap)
-            .sort((a, b) => b.date.localeCompare(a.date))
-            .slice(0, 10);
-          projectUsage[encodedDir] = {
-            displayName, cwd: cwd || null, totalCostUSD: projTotalCost,
-            daysActive: projDates.size, firstActivity: projFirstDate,
-            lastActivity: projLastDate, models: projModels, dailyBreakdown,
-          };
-        }
+        anyCcusageOk = true;
+      } catch (e) {
+        ccusageErrors.push(`${host.id}: ${e.message}`);
       }
-
-      dailyModelTokensArr = Object.keys(tokensByDate).sort().map(date => ({ date, tokensByModel: tokensByDate[date] }));
-      dailyCostArr = Object.keys(costByDate).sort().map(date => ({ date, costByModel: costByDate[date] }));
-    } catch (e) {
-      // ccusage failed — preserve old token/cost data if available
-      if (acc?.dailyModelTokens?.length) dailyModelTokensArr = acc.dailyModelTokens;
-      if (acc?.dailyCost?.length) dailyCostArr = acc.dailyCost;
-      if (acc?.modelUsage && Object.keys(acc.modelUsage).length) modelUsage = acc.modelUsage;
-      if (acc?.totalCostUSD) totalCost = acc.totalCostUSD;
-      if (acc?.projectUsage && Object.keys(acc.projectUsage).length) projectUsage = acc.projectUsage;
-      console.error('ccusage failed — using cached token/cost data.', e.message);
     }
 
-    const firstSessionDate = dailyActivityArr.length > 0 ? dailyActivityArr[0].date : (acc?.firstSessionDate || null);
+    if (anyCcusageOk) {
+      dailyModelTokensArr = Object.keys(tokensByDate).sort().map(date => ({ date, tokensByModel: tokensByDate[date] }));
+      dailyCostArr = Object.keys(costByDate).sort().map(date => ({ date, costByModel: costByDate[date] }));
+    } else {
+      // All ccusage calls failed — preserve old token/cost data if available
+      if (seed?.dailyModelTokens?.length) dailyModelTokensArr = seed.dailyModelTokens;
+      if (seed?.dailyCost?.length) dailyCostArr = seed.dailyCost;
+      if (seed?.modelUsage && Object.keys(seed.modelUsage).length) modelUsage = seed.modelUsage;
+      if (seed?.totalCostUSD) totalCost = seed.totalCostUSD;
+      if (seed?.projectUsage && Object.keys(seed.projectUsage).length) projectUsage = seed.projectUsage;
+    }
+    if (ccusageErrors.length) console.error('ccusage errors:', ccusageErrors.join(' | '));
+
+    const firstSessionDate = dailyActivityArr.length > 0 ? dailyActivityArr[0].date : (seed?.firstSessionDate || null);
 
     const result = {
-      version: 7, lastComputedDate: todayStr(),
+      version: STATS_SCHEMA_VERSION, lastComputedDate: todayStr(),
       dailyActivity: dailyActivityArr, dailyModelTokens: dailyModelTokensArr, dailyCost: dailyCostArr,
       modelUsage, projectUsage, totalSessions: allSessions.size,
       totalMessages: dailyActivityArr.reduce((s, d) => s + d.messageCount, 0),
@@ -882,7 +987,7 @@ async function rebuildStats() {
     };
 
     await fs.writeFile(CLAUDE_STATS_FILE, JSON.stringify(result), 'utf-8');
-    console.log(`Stats rebuilt: scanned ${scannedCount} new/changed files, skipped ${skippedCount} unchanged, ${dailyActivityArr.length} days total`);
+    console.log(`Stats rebuilt: scanned ${scannedCount} new/changed files, skipped ${skippedCount} unchanged, ${dailyActivityArr.length} days total, ${hosts.length} host(s)`);
   } catch (e) {
     console.error('Stats rebuild failed:', e.message);
   } finally {
@@ -892,8 +997,6 @@ async function rebuildStats() {
 
 // Rebuild on server start
 rebuildStats();
-
-const STATS_SCHEMA_VERSION = 7;
 
 app.get('/api/claude-stats', async (_req, res) => {
   try {
@@ -930,11 +1033,15 @@ if (!existsSync(PINGS_FILE)) writeFileSync(PINGS_FILE, '[]');
 app.post('/api/claude-ping', async (req, res) => {
   try {
     const b = req.body;
+    const host = typeof b.host === 'string' && b.host ? b.host : 'local';
+    const baseProject = b.cwd ? path.basename(b.cwd) : 'unknown';
+    const project = host === 'local' ? baseProject : `[${host}] ${baseProject}`;
     const pings = JSON.parse(await fs.readFile(PINGS_FILE, 'utf-8'));
     pings.push({
       ts: new Date().toISOString(),
       session: b.session_id || 'unknown',
-      project: b.cwd ? path.basename(b.cwd) : 'unknown',
+      project,
+      host,
     });
     // Keep last 90 days (~keep generous, trim if > 50k)
     if (pings.length > 50000) pings.splice(0, pings.length - 50000);
@@ -943,6 +1050,96 @@ app.post('/api/claude-ping', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// --- Remote Hosts (SSH session-log sync) ---
+async function getRemoteHosts() {
+  try { return JSON.parse(await fs.readFile(REMOTE_HOSTS_FILE, 'utf-8')); }
+  catch { return []; }
+}
+
+app.get('/api/remote-hosts', async (_req, res) => {
+  try { res.json(await getRemoteHosts()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/remote-hosts', async (req, res) => {
+  try {
+    const { id, label, sshTarget, projectsPath } = req.body || {};
+    if (!id || !SAFE_ID_RE.test(id)) return res.status(400).json({ error: 'id must be lowercase alphanumeric/hyphen, 1-32 chars' });
+    if (!sshTarget || typeof sshTarget !== 'string') return res.status(400).json({ error: 'sshTarget required (e.g. user@host or ssh-alias)' });
+    // Reject shell-unsafe chars in sshTarget (rsync still needs it as a single arg but be defensive)
+    if (/[\s;|&$`<>\\"']/.test(sshTarget)) return res.status(400).json({ error: 'sshTarget contains unsafe characters' });
+    const hosts = await getRemoteHosts();
+    if (hosts.find(h => h.id === id)) return res.status(409).json({ error: 'id already exists' });
+    hosts.push({
+      id,
+      label: label || id,
+      sshTarget,
+      projectsPath: projectsPath || '~/.claude/projects',
+      lastSyncAt: null,
+      lastSyncOk: null,
+    });
+    await writeJSON(REMOTE_HOSTS_FILE, hosts);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/remote-hosts/:id', async (req, res) => {
+  try {
+    const hosts = (await getRemoteHosts()).filter(h => h.id !== req.params.id);
+    await writeJSON(REMOTE_HOSTS_FILE, hosts);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+function runRsync(sshTarget, remotePath, localPath) {
+  return new Promise((resolve) => {
+    // Trailing slash on source copies contents; localPath auto-created
+    const src = `${sshTarget}:${remotePath.replace(/\/$/, '')}/`;
+    const args = ['-az', '--delete', src, localPath];
+    const proc = spawn('rsync', args);
+    let stderr = '';
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('error', (err) => resolve({ ok: false, error: err.message }));
+    proc.on('close', (code) => {
+      if (code === 0) resolve({ ok: true });
+      else resolve({ ok: false, error: `rsync exit ${code}: ${stderr.trim().slice(0, 500)}` });
+    });
+  });
+}
+
+app.post('/api/sync-remote', async (req, res) => {
+  try {
+    const targetId = req.query.id || null;
+    const hosts = await getRemoteHosts();
+    const toSync = targetId ? hosts.filter(h => h.id === targetId) : hosts;
+    if (toSync.length === 0) return res.status(404).json({ error: 'No remote hosts configured' });
+
+    const results = [];
+    for (const h of toSync) {
+      const localPath = path.join(REMOTE_ROOT, h.id, 'projects');
+      mkdirSync(localPath, { recursive: true });
+      const r = await runRsync(h.sshTarget, h.projectsPath, localPath);
+      results.push({ id: h.id, ...r });
+      h.lastSyncAt = new Date().toISOString();
+      h.lastSyncOk = r.ok;
+      if (!r.ok) h.lastSyncError = r.error;
+      else delete h.lastSyncError;
+    }
+    // Persist sync metadata
+    const all = await getRemoteHosts();
+    for (const h of all) {
+      const updated = toSync.find(t => t.id === h.id);
+      if (updated) Object.assign(h, updated);
+    }
+    await writeJSON(REMOTE_HOSTS_FILE, all);
+
+    // Rebuild stats if any succeeded
+    if (results.some(r => r.ok)) rebuildStats();
+
+    res.json({ results });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/claude-pings', async (_req, res) => {
