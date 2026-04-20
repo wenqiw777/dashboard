@@ -66,16 +66,40 @@ function parseGitHubUrl(url) {
   return m ? { owner: m[1], repo: m[2].replace(/\.git$/, '') } : null;
 }
 
-// Simple in-memory cache (10 min TTL)
-const cache = new Map();
-const CACHE_TTL = 10 * 60 * 1000;
+// Persistent disk-backed cache with 1-hour TTL
+const CACHE_FILE = path.join(DATA_DIR, 'github-cache.json');
+const CACHE_TTL = 60 * 60 * 1000; // 1 hour
+let cache = new Map();
 
-// Sweep expired cache entries every 30 min to prevent memory leak
+// Load cache from disk on startup
+try {
+  if (existsSync(CACHE_FILE)) {
+    const entries = JSON.parse(await fs.readFile(CACHE_FILE, 'utf-8'));
+    const now = Date.now();
+    for (const [key, val] of entries) {
+      if (now - val.time < CACHE_TTL) cache.set(key, val);
+    }
+  }
+} catch { /* start fresh */ }
+
+let cacheWritePending = false;
+function scheduleCacheWrite() {
+  if (cacheWritePending) return;
+  cacheWritePending = true;
+  setTimeout(async () => {
+    cacheWritePending = false;
+    try { await fs.writeFile(CACHE_FILE, JSON.stringify([...cache])); } catch { /* ignore */ }
+  }, 2000);
+}
+
+// Sweep expired cache entries every 30 min
 setInterval(() => {
   const now = Date.now();
+  let swept = false;
   for (const [key, val] of cache) {
-    if (now - val.time >= CACHE_TTL) cache.delete(key);
+    if (now - val.time >= CACHE_TTL) { cache.delete(key); swept = true; }
   }
+  if (swept) scheduleCacheWrite();
 }, 30 * 60 * 1000);
 
 // Cap persistent stats caches to prevent unbounded file growth
@@ -117,6 +141,7 @@ async function githubFetch(endpoint) {
 
   const data = await res.json();
   cache.set(endpoint, { data, time: Date.now() });
+  scheduleCacheWrite();
   return data;
 }
 
@@ -142,6 +167,7 @@ app.put('/api/config', async (req, res) => {
     if (authorAliases !== undefined) existing.authorAliases = authorAliases;
     await writeJSON(CONFIG_FILE, existing);
     cache.clear();
+    scheduleCacheWrite();
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -626,12 +652,12 @@ app.post('/api/rename', async (req, res) => {
     const { dir, fullPath, dirId } = await resolvePath(itemPath);
     const newFullPath = path.join(path.dirname(fullPath), newName);
     if (!newFullPath.startsWith(dir.path)) return res.status(400).json({ error: 'Invalid path' });
-    try { await fs.access(newFullPath); return res.status(409).json({ error: 'Name already exists' }); } catch {}
+    try { await fs.oldStatsess(newFullPath); return res.status(409).json({ error: 'Name already exists' }); } catch {}
     await fs.rename(fullPath, newFullPath);
     if (fullPath.endsWith('.md')) {
       const tsxOld = fullPath.replace(/\.md$/, '.tsx');
       const tsxNew = newFullPath.replace(/\.md$/, '.tsx');
-      try { await fs.access(tsxOld); await fs.rename(tsxOld, tsxNew); } catch {}
+      try { await fs.oldStatsess(tsxOld); await fs.rename(tsxOld, tsxNew); } catch {}
     }
     res.json({ ok: true, newPath: `${dirId}/${path.relative(dir.path, newFullPath)}` });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -692,7 +718,7 @@ app.post('/api/move', async (req, res) => {
     if (fromResolved.fullPath.endsWith('.md')) {
       const tsxFrom = fromResolved.fullPath.replace(/\.md$/, '.tsx');
       const tsxTo = fullTo.replace(/\.md$/, '.tsx');
-      try { await fs.access(tsxFrom); await fs.rename(tsxFrom, tsxTo); } catch {}
+      try { await fs.oldStatsess(tsxFrom); await fs.rename(tsxFrom, tsxTo); } catch {}
     }
     res.json({ ok: true, newPath: `${toResolved.dirId}/${path.relative(toResolved.dir.path, fullTo)}` });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -739,17 +765,17 @@ async function rebuildStats() {
   if (statsRebuilding) return;
   statsRebuilding = true;
   try {
-    // Load accumulated stats (processedFiles tracks what we've already scanned)
-    let acc = null;
+    // Load existing stats (includes _fileContribs and _processedFiles for incremental scan)
+    let oldStats = null;
     try {
       const raw = await fs.readFile(CLAUDE_STATS_FILE, 'utf-8');
-      acc = JSON.parse(raw);
-    } catch { /* fresh build */ }
+      oldStats = JSON.parse(raw);
+    } catch { /* no existing stats, fresh build */ }
 
     // Schema v8 introduced host-namespaced session/projectCwd keys.
     // Old caches (v<8) have unprefixed keys — discard seed data and rebuild fresh.
-    const seedUsable = acc && (acc.version ?? 0) >= STATS_SCHEMA_VERSION;
-    const seed = seedUsable ? acc : null;
+    const seedUsable = oldStats && (oldStats.version ?? 0) >= STATS_SCHEMA_VERSION;
+    const seed = seedUsable ? oldStats : null;
 
     // Accumulated data structures — seed from existing stats or start empty
     const processedFiles = new Map(Object.entries(seed?.processedFiles || {})); // path -> { size, mtimeMs }
@@ -847,11 +873,6 @@ async function rebuildStats() {
           scannedCount++;
         }
       }
-    }
-
-    // Clean up processedFiles entries for deleted files (don't lose accumulated data though)
-    for (const p of processedFiles.keys()) {
-      if (!currentFiles.has(p)) processedFiles.delete(p);
     }
 
     const dailyActivityArr = [...dailyActivityMap.values()]
@@ -980,7 +1001,7 @@ async function rebuildStats() {
       totalCostUSD: totalCost, longestSession,
       firstSessionDate,
       hourCounts, totalSpeculationTimeSavedMs: 0, shotDistribution: {},
-      // Internal: persisted for incremental accumulation (not consumed by frontend)
+      // Internal: persisted for incremental oldStatsumulation (not consumed by frontend)
       processedFiles: Object.fromEntries(processedFiles),
       _sessions: [...allSessions],
       _projectCwd: projectCwd,
@@ -989,10 +1010,18 @@ async function rebuildStats() {
     await fs.writeFile(CLAUDE_STATS_FILE, JSON.stringify(result), 'utf-8');
     console.log(`Stats rebuilt: scanned ${scannedCount} new/changed files, skipped ${skippedCount} unchanged, ${dailyActivityArr.length} days total, ${hosts.length} host(s)`);
   } catch (e) {
-    console.error('Stats rebuild failed:', e.message);
+    console.error('Stats update failed:', e.message);
   } finally {
     statsRebuilding = false;
   }
+}
+
+// Merge daily arrays by date: new scan wins for dates it has, old dates preserved
+function mergeDailyByDate(oldArr, newArr, dateKey = 'date') {
+  const map = new Map();
+  for (const entry of (oldArr || [])) map.set(entry[dateKey], entry);
+  for (const entry of (newArr || [])) map.set(entry[dateKey], entry);
+  return [...map.values()].sort((a, b) => a[dateKey].localeCompare(b[dateKey]));
 }
 
 // Rebuild on server start
@@ -1009,13 +1038,11 @@ app.get('/api/claude-stats', async (_req, res) => {
         // Schema mismatch: force synchronous rebuild so the client gets fresh data immediately
         await rebuildStats();
         const fresh = JSON.parse(await fs.readFile(CLAUDE_STATS_FILE, 'utf-8'));
-        const { processedFiles: _pf, _sessions: _s, _projectCwd: _pc, ...publicFresh } = fresh;
-        res.json(publicFresh);
+        res.json(fresh);
         return;
       }
       if (stats.lastComputedDate < todayStr()) rebuildStats();
-      const { processedFiles: _pf, _sessions: _s, _projectCwd: _pc, ...publicStats } = stats;
-      res.json(publicStats);
+      res.json(stats);
     } catch {
       // No cache file yet, rebuild and return empty for now
       rebuildStats();
@@ -1150,4 +1177,5 @@ app.get('/api/claude-pings', async (_req, res) => {
   }
 });
 
-app.listen(8000, () => console.log('API server on :8000'));
+const port = process.env.PORT || 8000;
+app.listen(port, () => console.log(`API server on :${port}`));

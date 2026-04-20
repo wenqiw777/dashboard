@@ -304,6 +304,7 @@ export default function TrackerApp() {
   const [customDate, setCustomDate] = useState<Date | null>(null)
   const [showCalendar, setShowCalendar] = useState(false)
   const [showChart, setShowChart] = useState(true)
+  const [tokenCostMode, setTokenCostMode] = useState<'tokens' | 'cost'>('tokens')
   const [viewTab, setViewTab] = useState<ViewTab>('commits')
   const [loading, setLoading] = useState(false)
   const [initialized, setInitialized] = useState(false)
@@ -336,7 +337,12 @@ export default function TrackerApp() {
   const tooltipTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastFittedDateRef = useRef<string | null>(null)
 
-  const loadClaudeStats = useCallback(async () => {
+  const lastClaudeStatsFetch = useRef(0)
+
+  const loadClaudeStats = useCallback(async (force?: boolean) => {
+    const now = Date.now()
+    if (!force && now - lastClaudeStatsFetch.current < 60_000) return
+    lastClaudeStatsFetch.current = now
     try {
       const [statsRes, pingsRes] = await Promise.all([
         fetch('/api/claude-stats'),
@@ -385,15 +391,23 @@ export default function TrackerApp() {
     // no-op: chart now uses activity state directly
   }, [])
 
-  const loadActivity = useCallback(async () => {
+  const lastActivityFetch = useRef<{ key: string; time: number }>({ key: '', time: 0 })
+
+  const loadActivity = useCallback(async (force?: boolean) => {
     if (repos.length === 0) { setActivity([]); setPrData([]); return }
+    const { since, until } = getDateRange(dateRange, customDate || undefined)
+    const params = new URLSearchParams({ since, until })
+    if (config.githubUsername) params.set('author', config.githubUsername)
+
+    // Throttle: skip if same params fetched within 60s
+    const fetchKey = params.toString()
+    const now = Date.now()
+    if (!force && fetchKey === lastActivityFetch.current.key && now - lastActivityFetch.current.time < 60_000) return
+    lastActivityFetch.current = { key: fetchKey, time: now }
+
     setLoading(true)
     setError(null)
     try {
-      const { since, until } = getDateRange(dateRange, customDate || undefined)
-      const params = new URLSearchParams({ since, until })
-      if (config.githubUsername) params.set('author', config.githubUsername)
-
       const [actRes, prRes] = await Promise.all([
         fetch(`/api/activity?${params}`),
         fetch(`/api/prs?${params}`),
@@ -1779,11 +1793,11 @@ export default function TrackerApp() {
                 <div className="t-stat">
                   <div className="t-stat-val">
                     {(() => {
-                      const total = Object.values(claudeStats.modelUsage).reduce((s, m) => s + m.outputTokens, 0)
-                      return total >= 1_000_000 ? `${(total / 1_000_000).toFixed(1)}M` : `${(total / 1000).toFixed(0)}k`
+                      const total = Object.values(claudeStats.modelUsage).reduce((s, m) => s + m.inputTokens + m.outputTokens, 0)
+                      return total >= 1_000_000_000 ? `${(total / 1_000_000_000).toFixed(1)}B` : total >= 1_000_000 ? `${(total / 1_000_000).toFixed(1)}M` : `${(total / 1000).toFixed(0)}k`
                     })()}
                   </div>
-                  <div className="t-stat-label">Output Tokens</div>
+                  <div className="t-stat-label">Total Tokens</div>
                 </div>
                 <div className="t-stat">
                   <div className="t-stat-val">
@@ -1855,25 +1869,39 @@ export default function TrackerApp() {
                 </div>
               )}
 
-              {/* Token Usage by Model */}
-              {claudeTokenChart && (
+              {/* Token / Cost by Model (toggle) */}
+              {(claudeTokenChart || claudeCostChart) && (
                 <div className="t-chart-card">
                   <div className="t-chart-header">
                     <Zap size={14} />
-                    <span>Tokens by Model — Last 30 Days</span>
+                    <span>{tokenCostMode === 'tokens' ? 'Tokens by Model' : 'Daily Cost'} — Last 30 Days</span>
+                    <div style={{ marginLeft: 'auto', display: 'flex', gap: 2, background: 'var(--bg-hover)', borderRadius: 6, padding: 2 }}>
+                      <button
+                        onClick={() => setTokenCostMode('tokens')}
+                        style={{
+                          padding: '2px 8px', fontSize: 11, borderRadius: 4, border: 'none', cursor: 'pointer',
+                          background: tokenCostMode === 'tokens' ? 'var(--bg-card)' : 'transparent',
+                          color: tokenCostMode === 'tokens' ? 'var(--text-primary)' : 'var(--text-muted)',
+                          boxShadow: tokenCostMode === 'tokens' ? '0 1px 2px rgba(0,0,0,.1)' : 'none',
+                        }}
+                      >Tokens</button>
+                      <button
+                        onClick={() => setTokenCostMode('cost')}
+                        style={{
+                          padding: '2px 8px', fontSize: 11, borderRadius: 4, border: 'none', cursor: 'pointer',
+                          background: tokenCostMode === 'cost' ? 'var(--bg-card)' : 'transparent',
+                          color: tokenCostMode === 'cost' ? 'var(--text-primary)' : 'var(--text-muted)',
+                          boxShadow: tokenCostMode === 'cost' ? '0 1px 2px rgba(0,0,0,.1)' : 'none',
+                        }}
+                      >Cost</button>
+                    </div>
                   </div>
-                  <ReactEChartsCore echarts={echarts} option={claudeTokenChart} style={{ height: 200 }} notMerge />
-                </div>
-              )}
-
-              {/* Daily Cost by Model */}
-              {claudeCostChart && (
-                <div className="t-chart-card">
-                  <div className="t-chart-header">
-                    <Zap size={14} />
-                    <span>Daily Cost — Last 30 Days</span>
-                  </div>
-                  <ReactEChartsCore echarts={echarts} option={claudeCostChart} style={{ height: 200 }} notMerge />
+                  {tokenCostMode === 'tokens' && claudeTokenChart && (
+                    <ReactEChartsCore echarts={echarts} option={claudeTokenChart} style={{ height: 200 }} notMerge />
+                  )}
+                  {tokenCostMode === 'cost' && claudeCostChart && (
+                    <ReactEChartsCore echarts={echarts} option={claudeCostChart} style={{ height: 200 }} notMerge />
+                  )}
                 </div>
               )}
 
