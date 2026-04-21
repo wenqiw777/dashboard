@@ -3,7 +3,7 @@ import cors from 'cors';
 import fs from 'fs/promises';
 import { existsSync, mkdirSync, writeFileSync, createReadStream } from 'fs';
 import { createInterface } from 'readline';
-import { execSync, spawn } from 'child_process';
+import { execSync, execFileSync, spawn } from 'child_process';
 import path from 'path';
 import os from 'os';
 
@@ -978,6 +978,75 @@ async function rebuildStats() {
       }
     }
 
+    // Merge subproject entries into their repo-root parent.
+    // Local: use `git rev-parse --show-toplevel`. Remote: use encodedDir prefix heuristic.
+    {
+      const gitRootCache = new Map();
+      const getGitRoot = (cwd) => {
+        if (!cwd) return null;
+        if (gitRootCache.has(cwd)) return gitRootCache.get(cwd);
+        let root = null;
+        try {
+          root = execFileSync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'],
+            { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() || null;
+        } catch { /* not a git repo */ }
+        gitRootCache.set(cwd, root);
+        return root;
+      };
+
+      // Local: resolve git root to merge subprojects.
+      // Remote: leave untouched (no reliable way to detect repo roots without SSH).
+      const rootKeyOf = {};
+      for (const [key, p] of Object.entries(projectUsage)) {
+        if (p.host === 'local' && p.cwd) {
+          rootKeyOf[key] = `local:${getGitRoot(p.cwd) || p.cwd}`;
+        } else {
+          rootKeyOf[key] = key;
+        }
+      }
+
+      const merged = {};
+      for (const [key, p] of Object.entries(projectUsage)) {
+        const rk = rootKeyOf[key];
+        if (!merged[rk]) {
+          merged[rk] = {
+            displayName: p.displayName, cwd: p.cwd, totalCostUSD: 0,
+            daysActive: 0, firstActivity: p.firstActivity, lastActivity: p.lastActivity,
+            models: {}, dailyBreakdown: [], host: p.host,
+          };
+        }
+        const M = merged[rk];
+        M.totalCostUSD += p.totalCostUSD;
+        M.daysActive = Math.max(M.daysActive, p.daysActive);
+        if (p.firstActivity < M.firstActivity) M.firstActivity = p.firstActivity;
+        if (p.lastActivity > M.lastActivity) M.lastActivity = p.lastActivity;
+        for (const [m, v] of Object.entries(p.models)) {
+          const cur = M.models[m] || { outputTokens: 0, costUSD: 0 };
+          M.models[m] = { outputTokens: cur.outputTokens + v.outputTokens, costUSD: cur.costUSD + v.costUSD };
+        }
+        for (const d of p.dailyBreakdown || []) {
+          let day = M.dailyBreakdown.find(x => x.date === d.date);
+          if (!day) { day = { date: d.date, totalCostUSD: 0, models: {} }; M.dailyBreakdown.push(day); }
+          day.totalCostUSD += d.totalCostUSD;
+          for (const [m, v] of Object.entries(d.models)) {
+            const cur = day.models[m] || { outputTokens: 0, costUSD: 0 };
+            day.models[m] = { outputTokens: cur.outputTokens + v.outputTokens, costUSD: cur.costUSD + v.costUSD };
+          }
+        }
+        // Prefer displayName/cwd from the entry whose cwd equals the root
+        if (p.host === 'local' && p.cwd && rk === `local:${p.cwd}`) {
+          M.displayName = p.displayName;
+          M.cwd = p.cwd;
+        }
+      }
+      for (const M of Object.values(merged)) {
+        M.dailyBreakdown = M.dailyBreakdown.sort((a, b) => b.date.localeCompare(a.date)).slice(0, 10);
+        // Union of dailyBreakdown dates is a lower bound; already-computed daysActive is the per-entry max.
+        M.daysActive = Math.max(M.daysActive, new Set(M.dailyBreakdown.map(d => d.date)).size);
+      }
+      projectUsage = merged;
+    }
+
     if (anyCcusageOk) {
       dailyModelTokensArr = Object.keys(tokensByDate).sort().map(date => ({ date, tokensByModel: tokensByDate[date] }));
       dailyCostArr = Object.keys(costByDate).sort().map(date => ({ date, costByModel: costByDate[date] }));
@@ -994,7 +1063,7 @@ async function rebuildStats() {
     const firstSessionDate = dailyActivityArr.length > 0 ? dailyActivityArr[0].date : (seed?.firstSessionDate || null);
 
     const result = {
-      version: STATS_SCHEMA_VERSION, lastComputedDate: todayStr(),
+      version: STATS_SCHEMA_VERSION, lastComputedDate: todayStr(), lastComputedAt: Date.now(),
       dailyActivity: dailyActivityArr, dailyModelTokens: dailyModelTokensArr, dailyCost: dailyCostArr,
       modelUsage, projectUsage, totalSessions: allSessions.size,
       totalMessages: dailyActivityArr.reduce((s, d) => s + d.messageCount, 0),
@@ -1024,8 +1093,10 @@ function mergeDailyByDate(oldArr, newArr, dateKey = 'date') {
   return [...map.values()].sort((a, b) => a[dateKey].localeCompare(b[dateKey]));
 }
 
-// Rebuild on server start
+// Rebuild on server start, then every 4 hours regardless of API traffic
+const STATS_REBUILD_INTERVAL_MS = 4 * 60 * 60 * 1000;
 rebuildStats();
+setInterval(() => { rebuildStats().catch(() => {}); }, STATS_REBUILD_INTERVAL_MS);
 
 app.get('/api/claude-stats', async (_req, res) => {
   try {
@@ -1041,7 +1112,9 @@ app.get('/api/claude-stats', async (_req, res) => {
         res.json(fresh);
         return;
       }
-      if (stats.lastComputedDate < todayStr()) rebuildStats();
+      const STATS_TTL_MS = 4 * 60 * 60 * 1000;
+      const ageMs = Date.now() - (stats.lastComputedAt || 0);
+      if (stats.lastComputedDate < todayStr() || ageMs > STATS_TTL_MS) rebuildStats();
       res.json(stats);
     } catch {
       // No cache file yet, rebuild and return empty for now

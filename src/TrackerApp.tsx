@@ -1,11 +1,10 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import {
   Plus, Trash2, Settings, RefreshCw, ExternalLink,
-  Activity, GitBranch, GitPullRequest, Clock, X, AlertCircle, ArrowLeft,
+  Activity, GitBranch, GitPullRequest, Clock, X, AlertCircle,
   CalendarDays, CalendarRange, Calendar, ChevronLeft, ChevronRight, ChevronDown, BarChart3,
   MessageSquare, Wrench, Zap, HardDrive
 } from 'lucide-react'
-import { Link } from 'react-router-dom'
 import ReactEChartsCore from 'echarts-for-react/lib/core'
 import * as echarts from 'echarts/core'
 import { BarChart, LineChart, PieChart, ScatterChart } from 'echarts/charts'
@@ -86,6 +85,7 @@ interface ClaudeStats {
     lastActivity: string
     models: Record<string, { outputTokens: number; costUSD: number }>
     dailyBreakdown?: { date: string; totalCostUSD: number; models: Record<string, { outputTokens: number; costUSD: number }> }[]
+    host?: string
   }>
   totalSessions: number
   totalMessages: number
@@ -321,6 +321,7 @@ export default function TrackerApp() {
   const [remoteForm, setRemoteForm] = useState({ id: '', label: '', sshTarget: '', projectsPath: '~/.claude/projects' })
   const [remoteSyncing, setRemoteSyncing] = useState<string | null>(null) // host id currently syncing, or 'all'
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set())
+  const [breakdownView, setBreakdownView] = useState<'project' | 'device'>('project')
   const [activityDate, setActivityDate] = useState(() => toDateKey(new Date()))
   const [activityView, setActivityView] = useState<'day' | 'week' | 'month' | 'projects'>('day')
   const [showActivityCal, setShowActivityCal] = useState(false)
@@ -1293,9 +1294,6 @@ export default function TrackerApp() {
       {/* Header */}
       <header className="t-header">
         <div className="t-header-left">
-          <Link to="/" className="t-back">
-            <ArrowLeft size={16} />
-          </Link>
           <Activity size={20} strokeWidth={2} />
           <h1>Work Tracker</h1>
         </div>
@@ -2200,12 +2198,19 @@ export default function TrackerApp() {
                 )}
               </div>
 
-              {/* Project Breakdown — projects with ≥ $1 spend, sorted by cost desc */}
+              {/* Project / Device Breakdown — entries with ≥ $1 spend, sorted by cost desc */}
               {claudeStats.projectUsage && Object.keys(claudeStats.projectUsage).length > 0 && (
                 <div className="t-chart-card">
                   <div className="t-chart-header">
                     <HardDrive size={14} />
-                    <span>Project Usage Breakdown</span>
+                    <span>Usage Breakdown</span>
+                    <div className="t-activity-tabs">
+                      {(['project', 'device'] as const).map(v => (
+                        <button key={v} className={`t-activity-tab ${breakdownView === v ? 'active' : ''}`} onClick={() => setBreakdownView(v)}>
+                          {v === 'project' ? 'By Project' : 'By Device'}
+                        </button>
+                      ))}
+                    </div>
                     <span className="t-chart-header-right">
                       est. total: {formatUSD(
                         Object.values(claudeStats.projectUsage).reduce((s, p) => s + p.totalCostUSD, 0)
@@ -2229,7 +2234,54 @@ export default function TrackerApp() {
                         mname.includes('sonnet-4-6') ? '#E8A87C' :
                         mname.includes('sonnet-4-5') ? '#B8856C' :
                         mname.includes('haiku') ? '#F0C4A8' : '#999'
-                      return Object.entries(claudeStats.projectUsage)
+
+                      type Entry = NonNullable<ClaudeStats['projectUsage']>[string] & { projectCount?: number }
+                      let entries: [string, Entry][]
+                      if (breakdownView === 'device') {
+                        const byHost = new Map<string, Entry>()
+                        for (const proj of Object.values(claudeStats.projectUsage)) {
+                          const hostId = proj.host || 'local'
+                          const rh = remoteHosts.find(h => h.id === hostId)
+                          const label = hostId === 'local' ? 'Local' : (rh?.label || hostId)
+                          let e = byHost.get(hostId)
+                          if (!e) {
+                            e = {
+                              displayName: label, cwd: null, totalCostUSD: 0, daysActive: 0,
+                              firstActivity: proj.firstActivity, lastActivity: proj.lastActivity,
+                              models: {}, dailyBreakdown: [], host: hostId, projectCount: 0,
+                            }
+                            byHost.set(hostId, e)
+                          }
+                          e.totalCostUSD += proj.totalCostUSD
+                          e.projectCount = (e.projectCount || 0) + 1
+                          if (proj.firstActivity < e.firstActivity) e.firstActivity = proj.firstActivity
+                          if (proj.lastActivity > e.lastActivity) e.lastActivity = proj.lastActivity
+                          for (const [m, v] of Object.entries(proj.models)) {
+                            const cur = e.models[m] || { outputTokens: 0, costUSD: 0 }
+                            e.models[m] = { outputTokens: cur.outputTokens + v.outputTokens, costUSD: cur.costUSD + v.costUSD }
+                          }
+                          for (const d of proj.dailyBreakdown || []) {
+                            let dayEntry = e.dailyBreakdown!.find(x => x.date === d.date)
+                            if (!dayEntry) {
+                              dayEntry = { date: d.date, totalCostUSD: 0, models: {} }
+                              e.dailyBreakdown!.push(dayEntry)
+                            }
+                            dayEntry.totalCostUSD += d.totalCostUSD
+                            for (const [m, v] of Object.entries(d.models)) {
+                              const cur = dayEntry.models[m] || { outputTokens: 0, costUSD: 0 }
+                              dayEntry.models[m] = { outputTokens: cur.outputTokens + v.outputTokens, costUSD: cur.costUSD + v.costUSD }
+                            }
+                          }
+                        }
+                        for (const e of byHost.values()) {
+                          e.dailyBreakdown = (e.dailyBreakdown || []).sort((a, b) => b.date.localeCompare(a.date)).slice(0, 10)
+                          e.daysActive = new Set((e.dailyBreakdown || []).map(d => d.date)).size
+                        }
+                        entries = Array.from(byHost.entries())
+                      } else {
+                        entries = Object.entries(claudeStats.projectUsage) as [string, Entry][]
+                      }
+                      return entries
                         .sort((a, b) => b[1].totalCostUSD - a[1].totalCostUSD)
                         .map(([key, proj]) => {
                           const stale = formatRelativeTime(proj.lastActivity).match(/mo ago|y ago/) !== null
@@ -2250,6 +2302,9 @@ export default function TrackerApp() {
                                   <ChevronDown size={12} className={`t-claude-project-chevron${isExpanded ? ' expanded' : ''}`} />
                                   <span className="t-claude-project-name" title={proj.cwd || key}>{proj.displayName}</span>
                                   <span className="t-claude-project-meta">
+                                    {breakdownView === 'device' && proj.projectCount != null && (
+                                      <> · {proj.projectCount} {proj.projectCount === 1 ? 'project' : 'projects'}</>
+                                    )}
                                     · {proj.daysActive} {proj.daysActive === 1 ? 'day' : 'days'} · {formatRelativeTime(proj.lastActivity)}
                                   </span>
                                 </div>

@@ -12,9 +12,8 @@ import {
   Search, Save, Plus, FolderPlus, Eye, Code2,
   Columns2, Layers, Minus, ZoomIn, ZoomOut, Maximize2,
   Moon, Sun, Pencil, Trash2, FolderInput, PanelLeftClose, PanelLeftOpen,
-  Activity, Upload, HardDrive, X
+  Upload, HardDrive, X
 } from 'lucide-react'
-import { Link } from 'react-router-dom'
 import './learn.css'
 
 // Slug & TOC helpers
@@ -619,11 +618,6 @@ function LearnApp() {
                 onChange={e => e.target.files && handleUpload(e.target.files)}
               />
             </div>
-
-            <Link to="/tracker" className="sidebar-tracker-link">
-              <Activity size={15} />
-              <span>Work Tracker</span>
-            </Link>
 
             <div className="sidebar-dirs">
               <button className="sidebar-dirs-toggle" onClick={() => setShowDirManager(!showDirManager)}>
