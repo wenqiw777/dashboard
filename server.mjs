@@ -759,7 +759,7 @@ async function collectJsonlFiles(dir) {
   return results;
 }
 
-const STATS_SCHEMA_VERSION = 8;
+const STATS_SCHEMA_VERSION = 9;
 
 async function rebuildStats() {
   if (statsRebuilding) return;
@@ -885,19 +885,22 @@ async function rebuildStats() {
     const ccusageBin = path.join(__dirname, 'node_modules', '.bin', 'ccusage');
     const ccusageCmd = existsSync(ccusageBin) ? ccusageBin : 'ccusage';
     let dailyModelTokensArr = [];
+    let dailyTypeTokensArr = [];
     let dailyCostArr = [];
     let modelUsage = {};
     let totalCost = 0;
     let projectUsage = {};
     const tokensByDate = {};
+    const typeByDate = {};
     const costByDate = {};
     let anyCcusageOk = false;
     const ccusageErrors = [];
 
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
     for (const host of hosts) {
       try {
         const env = { ...process.env, CLAUDE_CONFIG_DIR: host.root };
-        const out = execSync(`${ccusageCmd} daily --instances --json`, {
+        const out = execSync(`${ccusageCmd} daily --instances --json -z ${tz}`, {
           encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024, env,
         });
         const ccusageJson = JSON.parse(out);
@@ -933,6 +936,11 @@ async function rebuildStats() {
               if (!tokensByDate[date]) tokensByDate[date] = {};
               tokensByDate[date][m.modelName] = (tokensByDate[date][m.modelName] || 0)
                 + m.inputTokens + m.outputTokens + m.cacheReadTokens + m.cacheCreationTokens;
+              if (!typeByDate[date]) typeByDate[date] = { input: 0, output: 0, cache_read: 0, cache_create: 0 };
+              typeByDate[date].input += m.inputTokens;
+              typeByDate[date].output += m.outputTokens;
+              typeByDate[date].cache_read += m.cacheReadTokens;
+              typeByDate[date].cache_create += m.cacheCreationTokens;
               if (!costByDate[date]) costByDate[date] = {};
               costByDate[date][m.modelName] = (costByDate[date][m.modelName] || 0) + m.cost;
 
@@ -1049,10 +1057,12 @@ async function rebuildStats() {
 
     if (anyCcusageOk) {
       dailyModelTokensArr = Object.keys(tokensByDate).sort().map(date => ({ date, tokensByModel: tokensByDate[date] }));
+      dailyTypeTokensArr = Object.keys(typeByDate).sort().map(date => ({ date, tokensByType: typeByDate[date] }));
       dailyCostArr = Object.keys(costByDate).sort().map(date => ({ date, costByModel: costByDate[date] }));
     } else {
       // All ccusage calls failed — preserve old token/cost data if available
       if (seed?.dailyModelTokens?.length) dailyModelTokensArr = seed.dailyModelTokens;
+      if (seed?.dailyTypeTokens?.length) dailyTypeTokensArr = seed.dailyTypeTokens;
       if (seed?.dailyCost?.length) dailyCostArr = seed.dailyCost;
       if (seed?.modelUsage && Object.keys(seed.modelUsage).length) modelUsage = seed.modelUsage;
       if (seed?.totalCostUSD) totalCost = seed.totalCostUSD;
@@ -1064,7 +1074,7 @@ async function rebuildStats() {
 
     const result = {
       version: STATS_SCHEMA_VERSION, lastComputedDate: todayStr(), lastComputedAt: Date.now(),
-      dailyActivity: dailyActivityArr, dailyModelTokens: dailyModelTokensArr, dailyCost: dailyCostArr,
+      dailyActivity: dailyActivityArr, dailyModelTokens: dailyModelTokensArr, dailyTypeTokens: dailyTypeTokensArr, dailyCost: dailyCostArr,
       modelUsage, projectUsage, totalSessions: allSessions.size,
       totalMessages: dailyActivityArr.reduce((s, d) => s + d.messageCount, 0),
       totalCostUSD: totalCost, longestSession,
@@ -1094,9 +1104,24 @@ function mergeDailyByDate(oldArr, newArr, dateKey = 'date') {
 }
 
 // Rebuild on server start, then every 4 hours regardless of API traffic
+// NOTE: mergeRemotePings must be scheduled AFTER PINGS_FILE is defined below
+// (it's moved to run right after the PINGS_FILE declaration).
 const STATS_REBUILD_INTERVAL_MS = 4 * 60 * 60 * 1000;
 rebuildStats();
-setInterval(() => { rebuildStats().catch(() => {}); }, STATS_REBUILD_INTERVAL_MS);
+setInterval(() => {
+  rebuildPingsFromJSONL().catch(() => {});
+  mergeRemotePings().catch(() => {});
+  rebuildStats().catch(() => {});
+}, STATS_REBUILD_INTERVAL_MS);
+
+app.post('/api/rebuild-stats', async (_req, res) => {
+  try {
+    await rebuildPingsFromJSONL().catch(() => {});
+    await rebuildStats();
+    const fresh = JSON.parse(await fs.readFile(CLAUDE_STATS_FILE, 'utf-8'));
+    res.json({ ok: true, lastComputedAt: fresh.lastComputedAt });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 app.get('/api/claude-stats', async (_req, res) => {
   try {
@@ -1112,9 +1137,13 @@ app.get('/api/claude-stats', async (_req, res) => {
         res.json(fresh);
         return;
       }
-      const STATS_TTL_MS = 4 * 60 * 60 * 1000;
+      // Rebuild if: schema stale / cache >30 min old / today not yet represented in daily data
+      // (the 3rd check catches mid-day activity that post-dates the last rebuild).
+      const STATS_TTL_MS = 30 * 60 * 1000;
       const ageMs = Date.now() - (stats.lastComputedAt || 0);
-      if (stats.lastComputedDate < todayStr() || ageMs > STATS_TTL_MS) rebuildStats();
+      const today = todayStr();
+      const todayMissing = !(stats.dailyCost || []).some(d => d.date === today);
+      if (stats.lastComputedDate < today || ageMs > STATS_TTL_MS || todayMissing) rebuildStats();
       res.json(stats);
     } catch {
       // No cache file yet, rebuild and return empty for now
@@ -1130,11 +1159,30 @@ app.get('/api/claude-stats', async (_req, res) => {
 const PINGS_FILE = path.join(DATA_DIR, 'claude-pings.json');
 if (!existsSync(PINGS_FILE)) writeFileSync(PINGS_FILE, '[]');
 
+// Rebuild pings from JSONL + merge remote pings.jsonl on startup
+rebuildPingsFromJSONL().catch(() => {});
+mergeRemotePings().catch(() => {});
+
+// Cache git roots to avoid spawning git per ping
+const gitRootCache = new Map();
+function resolveProjectName(cwd) {
+  if (!cwd) return 'unknown';
+  if (!gitRootCache.has(cwd)) {
+    let root = null;
+    try {
+      root = execFileSync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'],
+        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() || null;
+    } catch { /* not a git repo */ }
+    gitRootCache.set(cwd, root || cwd);
+  }
+  return path.basename(gitRootCache.get(cwd));
+}
+
 app.post('/api/claude-ping', async (req, res) => {
   try {
     const b = req.body;
     const host = typeof b.host === 'string' && b.host ? b.host : 'local';
-    const baseProject = b.cwd ? path.basename(b.cwd) : 'unknown';
+    const baseProject = host === 'local' ? resolveProjectName(b.cwd) : (b.cwd ? path.basename(b.cwd) : 'unknown');
     const project = host === 'local' ? baseProject : `[${host}] ${baseProject}`;
     const pings = JSON.parse(await fs.readFile(PINGS_FILE, 'utf-8'));
     pings.push({
@@ -1209,6 +1257,150 @@ function runRsync(sshTarget, remotePath, localPath) {
   });
 }
 
+// Single-file rsync. Non-fatal if file missing on remote (exit 23 = partial).
+function runRsyncFile(sshTarget, remoteFile, localFile) {
+  return new Promise((resolve) => {
+    const src = `${sshTarget}:${remoteFile}`;
+    const args = ['-az', '--ignore-missing-args', src, localFile];
+    const proc = spawn('rsync', args);
+    let stderr = '';
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('error', (err) => resolve({ ok: false, error: err.message }));
+    proc.on('close', (code) => {
+      if (code === 0 || code === 23) resolve({ ok: true });
+      else resolve({ ok: false, error: `rsync exit ${code}: ${stderr.trim().slice(0, 300)}` });
+    });
+  });
+}
+
+// Rebuild pings from every host's JSONL files (local + rsync'd remotes).
+// Bucket by (session, minute, project, host) so dense messages become sparse pings.
+// For each encoded dir, resolve ONE project name (git root locally, shortest cwd remotely).
+async function rebuildPingsFromJSONL() {
+  const scanHosts = await getScanHosts();
+  const projectNameOf = new Map();
+
+  // Pass 1: resolve project names per encoded dir
+  for (const host of scanHosts) {
+    let dirs = [];
+    try { dirs = await fs.readdir(host.projectsDir); } catch { continue; }
+    for (const encodedDir of dirs) {
+      const projDir = path.join(host.projectsDir, encodedDir);
+      let files = [];
+      try { files = (await fs.readdir(projDir)).filter(f => f.endsWith('.jsonl')); } catch { continue; }
+      const cwds = new Set();
+      for (const fname of files) {
+        try {
+          const content = await fs.readFile(path.join(projDir, fname), 'utf-8');
+          for (const line of content.split('\n')) {
+            if (!line.trim()) continue;
+            try { const e = JSON.parse(line); if (typeof e.cwd === 'string' && e.cwd) cwds.add(e.cwd); } catch {}
+          }
+        } catch {}
+      }
+      let name = null;
+      if (host.id === 'local') {
+        for (const cwd of cwds) {
+          try {
+            const root = execFileSync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'],
+              { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+            if (root) { name = path.basename(root); break; }
+          } catch {}
+        }
+      }
+      if (!name && cwds.size) name = path.basename([...cwds].sort((a, b) => a.length - b.length)[0]);
+      if (!name) name = encodedDir.replace(/^-/, '').replace(/-/g, '/').split('/').pop() || 'unknown';
+      projectNameOf.set(`${host.id}:${encodedDir}`, name);
+    }
+  }
+
+  // Pass 2: emit pings
+  const bucketed = new Map();
+  for (const host of scanHosts) {
+    let dirs = [];
+    try { dirs = await fs.readdir(host.projectsDir); } catch { continue; }
+    for (const encodedDir of dirs) {
+      const baseProject = projectNameOf.get(`${host.id}:${encodedDir}`) || 'unknown';
+      const project = host.id === 'local' ? baseProject : `[${host.label || host.id}] ${baseProject}`;
+      const projDir = path.join(host.projectsDir, encodedDir);
+      let files = [];
+      try { files = (await fs.readdir(projDir)).filter(f => f.endsWith('.jsonl')); } catch { continue; }
+      for (const fname of files) {
+        try {
+          const content = await fs.readFile(path.join(projDir, fname), 'utf-8');
+          for (const line of content.split('\n')) {
+            if (!line.trim()) continue;
+            try {
+              const e = JSON.parse(line);
+              const ts = e.timestamp;
+              if (!ts) continue;
+              if (e.type !== 'user' && e.type !== 'assistant') continue;
+              const session = e.sessionId || 'unknown';
+              const minute = ts.slice(0, 16);
+              const key = `${session}|${minute}|${project}|${host.id}`;
+              if (bucketed.has(key)) continue;
+              bucketed.set(key, { ts, session, project, host: host.id });
+            } catch {}
+          }
+        } catch {}
+      }
+    }
+  }
+
+  // Preserve existing POST-based pings (mac hook pings) that aren't in JSONL
+  const all = Array.from(bucketed.values());
+  const keyOf = (p) => `${p.ts}|${p.session}|${p.project}|${p.host || 'local'}`;
+  const seen = new Set(all.map(keyOf));
+  try {
+    const existing = JSON.parse(await fs.readFile(PINGS_FILE, 'utf-8'));
+    for (const p of existing) if (!seen.has(keyOf(p))) all.push(p);
+  } catch {}
+
+  all.sort((a, b) => a.ts.localeCompare(b.ts));
+  if (all.length > 200000) all.splice(0, all.length - 200000);
+  await writeJSON(PINGS_FILE, all);
+}
+
+// Merge remote hosts' pings.jsonl files into data/claude-pings.json (dedup).
+async function mergeRemotePings() {
+  let existing = null;
+  try { existing = JSON.parse(await fs.readFile(PINGS_FILE, 'utf-8')); } catch {}
+  // Defensive: if we can't even read the existing file, bail out — NEVER clobber.
+  if (!Array.isArray(existing)) return;
+  const keyOf = (p) => `${p.ts}|${p.session || '?'}|${p.project || '?'}|${p.host || 'local'}`;
+  const seen = new Set(existing.map(keyOf));
+  const merged = [...existing];
+  let added = 0;
+  const hosts = await getRemoteHosts().catch(() => []);
+  for (const h of hosts) {
+    const pingsPath = path.join(REMOTE_ROOT, h.id, 'pings.jsonl');
+    if (!existsSync(pingsPath)) continue;
+    let content = '';
+    try { content = await fs.readFile(pingsPath, 'utf-8'); } catch { continue; }
+    for (const line of content.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      try {
+        const p = JSON.parse(line);
+        if (!p.ts) continue;
+        const host = p.host || h.id;
+        const baseProject = p.cwd ? path.basename(p.cwd) : 'unknown';
+        const project = p.project || `[${h.label || h.id}] ${baseProject}`;
+        const normalized = { ts: p.ts, session: p.session || 'unknown', project, host };
+        const k = keyOf(normalized);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        merged.push(normalized);
+        added++;
+      } catch {}
+    }
+  }
+  // Only rewrite the file if we actually added something
+  if (added === 0) return;
+  merged.sort((a, b) => a.ts.localeCompare(b.ts));
+  if (merged.length > 50000) merged.splice(0, merged.length - 50000);
+  await writeJSON(PINGS_FILE, merged);
+}
+
 app.post('/api/sync-remote', async (req, res) => {
   try {
     const targetId = req.query.id || null;
@@ -1221,6 +1413,12 @@ app.post('/api/sync-remote', async (req, res) => {
       const localPath = path.join(REMOTE_ROOT, h.id, 'projects');
       mkdirSync(localPath, { recursive: true });
       const r = await runRsync(h.sshTarget, h.projectsPath, localPath);
+      // Also pull pings.jsonl (non-fatal). Derive remote home from projectsPath.
+      if (r.ok) {
+        const remotePingsPath = (h.projectsPath || '~/.claude/projects').replace(/\/projects\/?$/, '/pings.jsonl');
+        const localPings = path.join(REMOTE_ROOT, h.id, 'pings.jsonl');
+        await runRsyncFile(h.sshTarget, remotePingsPath, localPings);
+      }
       results.push({ id: h.id, ...r });
       h.lastSyncAt = new Date().toISOString();
       h.lastSyncOk = r.ok;
@@ -1235,8 +1433,12 @@ app.post('/api/sync-remote', async (req, res) => {
     }
     await writeJSON(REMOTE_HOSTS_FILE, all);
 
-    // Rebuild stats if any succeeded
-    if (results.some(r => r.ok)) rebuildStats();
+    // Rebuild pings + stats if any sync succeeded
+    if (results.some(r => r.ok)) {
+      rebuildPingsFromJSONL().catch(() => {});
+      mergeRemotePings().catch(() => {});
+      rebuildStats();
+    }
 
     res.json({ results });
   } catch (e) { res.status(500).json({ error: e.message }); }

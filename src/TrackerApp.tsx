@@ -74,6 +74,7 @@ interface ClaudeStats {
   lastComputedDate: string
   dailyActivity: { date: string; messageCount: number; sessionCount: number; toolCallCount: number }[]
   dailyModelTokens: { date: string; tokensByModel: Record<string, number> }[]
+  dailyTypeTokens?: { date: string; tokensByType: { input: number; output: number; cache_read: number; cache_create: number } }[]
   dailyCost?: { date: string; costByModel: Record<string, number> }[]
   modelUsage: Record<string, { inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number; costUSD?: number }>
   projectUsage?: Record<string, {
@@ -775,31 +776,28 @@ export default function TrackerApp() {
 
   const claudeTokenChart = useMemo(() => {
     if (!claudeStats) return null
-    const last30 = claudeStats.dailyModelTokens.slice(-30)
+    // Prefer type-broken-down data; fall back to model-based totals if unavailable (old cache)
+    const typeData = claudeStats.dailyTypeTokens?.slice(-30)
     const root = document.documentElement
     const cs = getComputedStyle(root)
     const resolve = (v: string) => { const m = v.match(/var\((.+)\)/); return m ? cs.getPropertyValue(m[1]).trim() || '#888' : v }
 
-    // Collect all model names
-    const modelSet = new Set<string>()
-    for (const d of last30) for (const m of Object.keys(d.tokensByModel)) modelSet.add(m)
-    const models = [...modelSet]
+    // Four token types, color-coded by "cost weight" (cheap → expensive)
+    const types = [
+      { key: 'cache_read' as const,   label: 'Cache Read',       color: '#F0C4A8' },   // cheap, usually huge
+      { key: 'input' as const,         label: 'Input',             color: '#E8A87C' },
+      { key: 'cache_create' as const, label: 'Cache Create',     color: '#C65D33' },
+      { key: 'output' as const,        label: 'Output',            color: '#8B3A1E' },  // most expensive
+    ]
 
-    const modelColors: Record<string, string> = {
-      'claude-opus-4-6': '#D97757',
-      'claude-opus-4-5-20251101': '#C65D33',
-      'claude-sonnet-4-6': '#E8A87C',
-      'claude-sonnet-4-5-20250929': '#B8856C',
-      'claude-haiku-4-5-20251001': '#F0C4A8',
-    }
-    const shortName = (m: string) => {
-      if (m.includes('opus-4-6')) return 'Opus 4.6'
-      if (m.includes('opus-4-5')) return 'Opus 4.5'
-      if (m.includes('sonnet-4-6')) return 'Sonnet 4.6'
-      if (m.includes('sonnet-4-5')) return 'Sonnet 4.5'
-      if (m.includes('haiku')) return 'Haiku 4.5'
-      return m
-    }
+    const last30 = typeData && typeData.length > 0
+      ? typeData
+      : claudeStats.dailyModelTokens.slice(-30).map(d => ({
+          date: d.date,
+          tokensByType: { input: 0, output: 0, cache_read: 0, cache_create: Object.values(d.tokensByModel).reduce((s, n) => s + n, 0) },
+        }))
+
+    const fmt = (v: number) => v >= 1e9 ? `${(v / 1e9).toFixed(1)}B` : v >= 1e6 ? `${(v / 1e6).toFixed(1)}M` : v >= 1000 ? `${(v / 1000).toFixed(0)}k` : String(v)
 
     return {
       grid: { left: 56, right: 12, top: 30, bottom: 28 },
@@ -808,7 +806,7 @@ export default function TrackerApp() {
         backgroundColor: resolve('var(--bg-card)'),
         borderColor: resolve('var(--border)'),
         textStyle: { color: resolve('var(--text-primary)'), fontSize: 12 },
-        valueFormatter: (v: number) => v >= 1000 ? `${(v / 1000).toFixed(1)}k` : String(v),
+        valueFormatter: (v: number) => fmt(v),
       },
       legend: {
         top: 0, right: 0,
@@ -824,19 +822,19 @@ export default function TrackerApp() {
       },
       yAxis: {
         type: 'value' as const,
-        axisLabel: { color: resolve('var(--text-muted)'), fontSize: 10, formatter: (v: number) => v >= 1000 ? `${(v / 1000).toFixed(0)}k` : String(v) },
+        axisLabel: { color: resolve('var(--text-muted)'), fontSize: 10, formatter: (v: number) => fmt(v) },
         splitLine: { lineStyle: { color: resolve('var(--border-light)'), type: 'dashed' as const } },
       },
-      series: models.map((m, i) => ({
-        name: shortName(m),
+      series: types.map((t, i) => ({
+        name: t.label,
         type: 'bar' as const,
         stack: 'tokens',
         barWidth: '60%',
         itemStyle: {
-          color: modelColors[m] || resolve(`var(--chart-${(i % 6) + 1})`),
-          borderRadius: i === models.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0],
+          color: t.color,
+          borderRadius: i === types.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0],
         },
-        data: last30.map(d => d.tokensByModel[m] || 0),
+        data: last30.map(d => d.tokensByType[t.key] || 0),
       })),
     }
   }, [claudeStats])
@@ -963,6 +961,14 @@ export default function TrackerApp() {
   // Build continuous activity blocks — each slice runs from one ping to the next,
   // colored by project. Only gaps > 30min create visual breaks.
   const GAP_MS = 30 * 60 * 1000
+  // Count unique 1-minute buckets covered by pings — naturally caps at 1440/day
+  // and deduplicates concurrent sessions working in parallel.
+  const countActiveMinutes = useCallback((pings: ClaudePing[]) => {
+    const minutes = new Set<number>()
+    for (const p of pings) minutes.add(Math.floor(new Date(p.ts).getTime() / 60000))
+    return minutes.size
+  }, [])
+
   const buildBlocks = useCallback((pings: ClaudePing[]) => {
     if (!pings.length) return []
     const sorted = [...pings].sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime())
@@ -1012,11 +1018,11 @@ export default function TrackerApp() {
     if (!dayPings.length) return null
 
     const blocks = buildBlocks(dayPings)
-    const totalMinutes = blocks.reduce((s, b) => s + Math.max(1, (b.end.getTime() - b.start.getTime()) / 60000), 0)
+    const totalMinutes = countActiveMinutes(dayPings)
     const sessionCount = new Set(dayPings.map(p => p.session)).size
 
     return { blocks, totalMinutes, totalTurns: dayPings.length, sessionCount }
-  }, [claudePings, activityDate, buildBlocks, filterPingsByDate])
+  }, [claudePings, activityDate, buildBlocks, filterPingsByDate, countActiveMinutes])
 
   // Auto-fit dayRange when switching to a new date (not on every background refresh)
   useEffect(() => {
@@ -1048,13 +1054,13 @@ export default function TrackerApp() {
       const key = toDateKey(d)
       const dayPings = filterPingsByDate(claudePings, key)
       const blocks = buildBlocks(dayPings)
-      const totalMinutes = blocks.reduce((s, b) => s + Math.max(1, (b.end.getTime() - b.start.getTime()) / 60000), 0)
+      const totalMinutes = countActiveMinutes(dayPings)
       days.push({ date: key, label: d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }), blocks, totalMinutes, turns: dayPings.length })
     }
 
     const weekTotal = days.reduce((s, d) => s + d.totalMinutes, 0)
     return { days, weekTotal }
-  }, [claudePings, activityDate, buildBlocks, filterPingsByDate])
+  }, [claudePings, activityDate, buildBlocks, filterPingsByDate, countActiveMinutes])
 
   // Month view: daily hours line chart
   const activityMonthChart = useMemo(() => {
@@ -1074,7 +1080,7 @@ export default function TrackerApp() {
       const key = toDateKey(date)
       const dayPings = filterPingsByDate(claudePings, key)
       const blocks = buildBlocks(dayPings)
-      const minutes = blocks.reduce((s, b) => s + Math.max(1, (b.end.getTime() - b.start.getTime()) / 60000), 0)
+      const minutes = countActiveMinutes(dayPings)
       dailyHours.push({ date: key, label: `${d}`, hours: minutes / 60, turns: dayPings.length })
     }
 
@@ -1125,7 +1131,7 @@ export default function TrackerApp() {
         }],
       },
     }
-  }, [claudePings, activityDate, buildBlocks, filterPingsByDate])
+  }, [claudePings, activityDate, buildBlocks, filterPingsByDate, countActiveMinutes])
 
   // Project stats: bar chart of hours per project
   const activityProjectChart = useMemo(() => {
@@ -1145,9 +1151,7 @@ export default function TrackerApp() {
 
     const projectMinutes = new Map<string, number>()
     for (const [project, pings] of projectPings) {
-      const blocks = buildBlocks(pings)
-      const totalMin = blocks.reduce((s, b) => s + Math.max(1, (b.end.getTime() - b.start.getTime()) / 60000), 0)
-      projectMinutes.set(project, totalMin)
+      projectMinutes.set(project, countActiveMinutes(pings))
     }
 
     const sorted = [...projectMinutes.entries()].sort((a, b) => b[1] - a[1])

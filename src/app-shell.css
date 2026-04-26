@@ -71,6 +71,7 @@
 .shell-page {
   height: 100%;
   width: 100%;
+  overflow: auto;
 }
 
 .shell-page[hidden] {
